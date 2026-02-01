@@ -815,7 +815,7 @@ with tab1:
     cbar = "Corr" if show_corr else "Cov"
 
     st.dataframe(mat, width='stretch', height=250)
-    fig_mat = go.Figure(data=go.Heatmap(z=mat.values, x=mat.columns, y=mat.index, colorbar=dict(title=cbar)))
+    fig_mat = go.Figure(data=go.Heatmap(z=mat.values, x=mat.columns, y=mat.index, colorscale="Reds", colorbar=dict(title=cbar)))
     fig_mat.update_layout(height=320, margin=dict(l=10, r=10, t=40, b=10), title=title)
     st.plotly_chart(fig_mat, config={'responsive': True})
 
