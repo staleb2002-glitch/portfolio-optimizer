@@ -696,7 +696,7 @@ with tab1:
     fig_w = go.Figure()
     fig_w.add_trace(go.Bar(x=weights_df["Asset"], y=weights_df["Weight"]))
     fig_w.update_layout(height=290, margin=dict(l=10, r=10, t=40, b=10), yaxis_title="Weight", title="Allocation")
-    st.plotly_chart(fig_w, width='stretch')
+    st.plotly_chart(fig_w, config={'responsive': True})
 
     st.subheader("Asset Performance & CAPM Analysis")
     
@@ -817,7 +817,7 @@ with tab1:
     st.dataframe(mat, width='stretch', height=250)
     fig_mat = go.Figure(data=go.Heatmap(z=mat.values, x=mat.columns, y=mat.index, colorbar=dict(title=cbar)))
     fig_mat.update_layout(height=320, margin=dict(l=10, r=10, t=40, b=10), title=title)
-    st.plotly_chart(fig_mat, width='stretch')
+    st.plotly_chart(fig_mat, config={'responsive': True})
 
 with tab2:
     st.subheader("Cumulative Returns (Base = 100)")
@@ -825,7 +825,7 @@ with tab2:
     for t in cum_returns.columns:
         fig_ret.add_trace(go.Scatter(x=cum_returns.index, y=cum_returns[t], mode="lines", name=t))
     fig_ret.update_layout(height=360, margin=dict(l=10, r=10, t=40, b=10), yaxis_title="Growth of 100")
-    st.plotly_chart(fig_ret, width='stretch')
+    st.plotly_chart(fig_ret, config={'responsive': True})
 
     st.subheader("Frontier (risky-only) + CML (if enabled)")
     fig = go.Figure()
@@ -854,7 +854,7 @@ with tab2:
         xaxis_title="Annualized Volatility",
         yaxis_title="Annualized Return",
     )
-    st.plotly_chart(fig, width='stretch')
+    st.plotly_chart(fig, config={'responsive': True})
 
 # ======================================================================
 # CHAT — Top-level (required by Streamlit) + actionable commands
