@@ -55,3 +55,4 @@ urllib3==2.6.3
 websockets==15.0.1
 yfinance==1.1.0
 zipp==3.23.0
+cvxpy==1.7.5
