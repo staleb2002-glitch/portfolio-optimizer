@@ -1,0 +1,9 @@
+This file documents the AI integration added to app.py.
+
+- Uses OpenAI Python library if installed and OPENAI_API_KEY provided.
+- Sidebar: toggle to enable AI and optional API key input (stored in session state).
+- The assistant is instructed to only use provided context and to output a JSON action when it intends to trigger an app action (e.g., {"action":"target_vol","target_vol":0.15}).
+- If JSON action detected, app will set st.session_state.ai_action/ai_target_vol and rerun.
+- Falls back to the local safe_assistant when OpenAI is not available or API key missing.
+
+Security: do not commit API keys. Use environment variable OPENAI_API_KEY or enter key in the sidebar for local testing.

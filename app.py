@@ -211,45 +211,46 @@ def compute_betas(asset_returns: pd.DataFrame, benchmark_returns: pd.Series) -> 
     return betas.astype(float)
 
 
-def capm_regression_analysis(asset_returns: pd.Series, benchmark_returns: pd.Series, rf: float) -> dict:
-    """
-    Perform CAPM regression analysis for a single asset.
-    Returns: {alpha, beta, r_squared, asset_excess_returns, capm_predicted_returns}
-    """
-    # Excess returns
-    asset_excess = asset_returns - rf
-    market_excess = benchmark_returns - rf
-    
-    # OLS regression: asset_excess = alpha + beta * market_excess + epsilon
-    X = market_excess.values.reshape(-1, 1)
-    y = asset_excess.values
-    
-    # Add intercept
-    X_with_const = np.column_stack([np.ones(len(X)), X])
-    
-    # Solve: beta_hat = (X'X)^-1 X'y
-    XtX_inv = np.linalg.pinv(X_with_const.T @ X_with_const)
-    beta_hat = XtX_inv @ X_with_const.T @ y
-    
-    alpha = beta_hat[0]
-    beta = beta_hat[1]
-    
-    # Predictions
-    y_pred = X_with_const @ beta_hat
-    
-    # R-squared
-    ss_res = np.sum((y - y_pred) ** 2)
-    ss_tot = np.sum((y - y.mean()) ** 2)
-    r_squared = 1 - (ss_res / ss_tot) if ss_tot > 0 else 0
-    
-    return {
-        'alpha': alpha,
-        'beta': beta,
-        'r_squared': r_squared,
-        'asset_excess_returns': asset_excess.values,
-        'capm_predicted_returns': market_excess.values * beta,
-        'market_excess_returns': market_excess.values,
-    }
+def compute_capm_metrics(
+    asset_returns: pd.DataFrame,
+    benchmark_returns: pd.Series,
+    rf_annual: float,
+) -> pd.DataFrame:
+    rf_daily = (1.0 + float(rf_annual)) ** (1.0 / TRADING_DAYS) - 1.0
+    mkt_excess = benchmark_returns - rf_daily
+
+    rows = []
+    for col in asset_returns.columns:
+        asset_excess = asset_returns[col] - rf_daily
+        common_idx = asset_excess.index.intersection(mkt_excess.index)
+        if len(common_idx) < 60:
+            continue
+        a = asset_excess.loc[common_idx]
+        m = mkt_excess.loc[common_idx]
+
+        mkt_var = float(m.var())
+        if mkt_var <= 1e-12:
+            continue
+
+        beta = float(a.cov(m)) / mkt_var
+        alpha = float(a.mean() - beta * m.mean())
+        corr = float(a.corr(m))
+        r2 = float(corr ** 2)
+
+        rows.append(
+            {
+                "Asset": col,
+                "Corr (excess vs mkt)": corr,
+                "Alpha (daily)": alpha,
+                "Beta": beta,
+                "R^2": r2,
+            }
+        )
+
+    df = pd.DataFrame(rows)
+    if not df.empty:
+        df = df.sort_values("R^2", ascending=False).reset_index(drop=True)
+    return df
 
 
 # ---------------- Chat: parsing + safe assistant ----------------
@@ -342,54 +343,12 @@ def safe_assistant(user_msg: str, ctx: dict) -> str:
     if target is not None:
         st.session_state.ai_target_vol = float(target)
         st.session_state.ai_action = "target_vol"
-        return f"Done. I'll cap your risk at **{target:.0%} volatility**. I'm recomputing the portfolio now..."
+        return f"✅ Done. I’ll cap your risk at **{target:.0%} volatility**. I’m recomputing the portfolio now…"
 
     # If ctx missing, refuse
     if not ctx or "weights_df" not in ctx:
         return "I don’t have portfolio results available yet. Please select assets/dates first."
-    # Comprehensive "explain" - summarize everything
-    if low == "explain" or low == "explain.":
-        wdf = ctx["weights_df"]
-        top = wdf.head(10)
-        w_lines = "\n".join([f"- {r['Asset']}: **{r['Weight']:.1%}**" for _, r in top.iterrows()])
-        
-        # Get correlation insights
-        corr_text = explain_correlation(wdf, ctx.get("corr_matrix"), top_n=4)
-        
-        # Get beta insights
-        betas = ctx.get("betas")
-        bench = ctx.get("benchmark", "SPY")
-        beta_text = ""
-        if betas is not None:
-            s = betas.sort_values(ascending=False)
-            beta_text = (
-                f"\n\n**Market Sensitivity (Betas vs {bench})**\n"
-                f"- Highest: **{s.index[0]}** (β={s.iloc[0]:.2f})\n"
-                f"- Lowest: **{s.index[-1]}** (β={s.iloc[-1]:.2f})\n"
-                f"- β>1 = more volatile than market; β<1 = more defensive"
-            )
-        
-        # Sharpe explanation
-        sharpe_text = (
-            f"\n\n**Risk-Adjusted Performance**\n"
-            f"- Sharpe Ratio: **{ctx.get('port_s'):.2f}** = (Return - Risk-Free) / Volatility\n"
-            f"- This measures how much excess return you get per unit of risk"
-        )
-        
-        return (
-            f"# Complete Portfolio Summary\n\n"
-            f"**Optimization Method**: {ctx.get('selected_label','')}\n"
-            f"- Expected Annual Return: **{ctx.get('port_r'):.2%}**\n"
-            f"- Annual Volatility (Risk): **{ctx.get('port_v'):.2%}**\n"
-            f"- Sharpe Ratio: **{ctx.get('port_s'):.2f}**\n"
-            f"- Risk-Free Rate: **{ctx.get('rf'):.2%}**\n\n"
-            f"**Portfolio Allocations** (Top Holdings)\n{w_lines}\n\n"
-            f"{corr_text}{beta_text}{sharpe_text}\n\n"
-            f"**Key Insights**\n"
-            f"- Your portfolio is optimized for {ctx.get('selected_label','').lower()}\n"
-            f"- Total assets: {len(wdf[wdf['Asset'] != 'RISK-FREE'])} risky assets\n"
-            f"- {'Includes risk-free asset allocation' if any(wdf['Asset'] == 'RISK-FREE') else 'Fully invested in risky assets'}"
-        )
+
     # Explanation intents
     if any(k in low for k in ["allocation", "weights", "explain my results", "summary", "explain results"]):
         wdf = ctx["weights_df"]
@@ -424,26 +383,24 @@ def safe_assistant(user_msg: str, ctx: dict) -> str:
 
     if "sharpe" in low:
         return (
-            "Sharpe measures risk-adjusted performance: **(Return - rf) / Volatility**.\n"
+            "Sharpe measures risk-adjusted performance: **(Return − rf) / Volatility**.\n"
             f"Here: return={ctx.get('port_r'):.2%}, rf={ctx.get('rf'):.2%}, vol={ctx.get('port_v'):.2%} "
-            f"=> Sharpe={ctx.get('port_s'):.2f}."
+            f"→ Sharpe={ctx.get('port_s'):.2f}."
         )
-
 
     return (
         "I can help with portfolio results. Try:\n"
-        "- 'explain' for complete portfolio summary\n"
-        "- 'I want to be capped at 15% risk'\n"
-        "- 'Explain allocations and correlation'\n"
-        "- 'Explain betas'\n"
-        "- 'Am I diversified?'"
+        "- “I want to be capped at 15% risk”\n"
+        "- “Explain allocations and correlation”\n"
+        "- “Explain betas”\n"
+        "- “Am I diversified?”"
     )
 
 
 # =========================
 # UI (Inputs)
 # =========================
-st.title("Portfolio Optimizer")
+st.title("📈 Portfolio Optimizer")
 st.write(
     '<span class="small-muted">Cumulative returns · Frontier + CML · Cov/Cor matrices · Betas · Actionable chat</span>',
     unsafe_allow_html=True,
@@ -462,8 +419,8 @@ with st.sidebar:
     benchmark = st.text_input("Market benchmark ticker", "SPY").strip().upper()
 
     st.markdown('<div class="sidebar-section"><div class="section-label">Risk-Free & Objective</div></div>', unsafe_allow_html=True)
-    rf_pct = st.slider("Risk-Free rate (annual %)", 0.0, 20.0, 2.0, 0.5)
-    rf = rf_pct / 100.0
+    rf_pct = st.slider("Risk-Free rate (annual %) ", 0.0, 20.0, 2.0, 0.1)
+    rf = float(rf_pct) / 100.0
     include_rf = st.checkbox("Include Risk-Free asset (CML)", value=True)
     leverage_cap = st.slider("Max risky exposure alpha (CML)", 0.0, 3.0, 2.0, 0.05)
 
@@ -492,7 +449,7 @@ with st.sidebar:
 # Get OpenAI API key from environment
 OPENAI_API_KEY = os.getenv('OPENAI_API_KEY', '')
 if not OPENAI_API_KEY:
-    st.warning("OPENAI_API_KEY not set. Set it as an environment variable to enable AI assistant.")
+    st.warning("⚠️ OPENAI_API_KEY not set. Set it as an environment variable to enable AI assistant.")
 
 # Guard
 if len(tickers) < 2:
@@ -503,12 +460,7 @@ if len(tickers) < 2:
 # Compute results
 # =========================
 try:
-    # Include benchmark in the download if it's not already there
-    tickers_with_bench = list(tickers)
-    if benchmark and benchmark not in tickers_with_bench:
-        tickers_with_bench.append(benchmark)
-    
-    prices = download_close_prices(tickers_with_bench, str(start), str(end))
+    prices = download_close_prices(tickers, str(start), str(end))
     if prices.empty or prices.shape[0] < 60:
         st.error("Not enough price data. Try different tickers or a wider date range.")
         st.stop()
@@ -521,11 +473,14 @@ try:
 
     # Betas vs benchmark
     betas = None
-    if benchmark and benchmark in prices.columns:
-        bench_rets = prices[benchmark].pct_change().dropna()
+    capm_df = pd.DataFrame()
+    bench_prices = download_close_prices([benchmark], str(start), str(end))
+    if not bench_prices.empty:
+        bench_rets = bench_prices.pct_change().dropna().iloc[:, 0]
         common_idx = rets.index.intersection(bench_rets.index)
         if len(common_idx) >= 60:
             betas = compute_betas(rets.loc[common_idx], bench_rets.loc[common_idx])
+            capm_df = compute_capm_metrics(rets.loc[common_idx], bench_rets.loc[common_idx], rf)
         else:
             st.warning(f"Not enough overlapping dates to compute betas vs {benchmark}.")
     else:
@@ -538,7 +493,7 @@ try:
 
     cvxpy_ok = _has_cvxpy()
     if use_cvxpy and not cvxpy_ok:
-        st.info("cvxpy not installed - target-vol risky-only uses simulation. (pip install cvxpy)")
+        st.info("cvxpy not installed → target-vol risky-only uses simulation. (pip install cvxpy)")
 
     # Tangency portfolio (risky-only)
     if use_cvxpy and cvxpy_ok:
@@ -655,6 +610,7 @@ try:
         "port_s": port_s,
         "weights_df": weights_df,
         "betas": betas,
+        "capm_df": capm_df,
         "benchmark": benchmark,
         "cov_matrix": cov_matrix,
         "corr_matrix": corr_matrix,
@@ -696,128 +652,99 @@ with tab1:
     fig_w = go.Figure()
     fig_w.add_trace(go.Bar(x=weights_df["Asset"], y=weights_df["Weight"]))
     fig_w.update_layout(height=290, margin=dict(l=10, r=10, t=40, b=10), yaxis_title="Weight", title="Allocation")
-    st.plotly_chart(fig_w, config={'responsive': True})
-
-    st.subheader("Asset Performance & CAPM Analysis")
-    
-    # Build asset performance table
-    risky_assets = [a for a in tickers if a != "RISK-FREE"]
-    if len(risky_assets) > 0 and betas is not None:
-        asset_perf_data = []
-        for ticker in risky_assets:
-            total_ret = ((prices[ticker].iloc[-1] / prices[ticker].iloc[0]) - 1)
-            ann_ret = (1 + total_ret) ** (TRADING_DAYS / len(prices)) - 1
-            asset_perf_data.append({
-                'Asset': ticker,
-                'Period Return': f"{total_ret:.2%}",
-                'Annualized Return': f"{ann_ret:.2%}",
-                'Beta': f"{betas[ticker]:.3f}" if ticker in betas.index else "N/A"
-            })
-        
-        perf_df = pd.DataFrame(asset_perf_data)
-        st.dataframe(perf_df, width='stretch', height=200)
-        
-        # Interactive CAPM analysis selector
-        st.write("**Click an asset to see CAPM Regression Analysis:**")
-        selected_asset = st.selectbox("Select asset for detailed analysis:", risky_assets, key="capm_select")
-        
-        if selected_asset and selected_asset in prices.columns and selected_asset in rets.columns:
-            if benchmark and benchmark in prices.columns:
-                try:
-                    # Get benchmark returns (daily, not annualized)
-                    bench_prices = prices[benchmark]
-                    bench_rets_daily = bench_prices.pct_change().dropna()
-                    
-                    # Get asset returns (daily)
-                    asset_rets_daily = rets[selected_asset]
-                    
-                    # Align returns by date
-                    common_idx = asset_rets_daily.index.intersection(bench_rets_daily.index)
-                    
-                    if len(common_idx) > 20:
-                        asset_rets_aligned = asset_rets_daily[common_idx].values
-                        bench_rets_aligned = bench_rets_daily[common_idx].values
-                        
-                        # Calculate excess returns
-                        rf_daily = rf / TRADING_DAYS
-                        asset_excess = asset_rets_aligned - rf_daily
-                        bench_excess = bench_rets_aligned - rf_daily
-                        
-                        # Simple linear regression
-                        X = bench_excess.reshape(-1, 1)
-                        y = asset_excess
-                        X_with_const = np.column_stack([np.ones(len(X)), X])
-                        XtX_inv = np.linalg.pinv(X_with_const.T @ X_with_const)
-                        beta_hat = XtX_inv @ X_with_const.T @ y
-                        
-                        alpha_daily = beta_hat[0]
-                        beta_val = beta_hat[1]
-                        
-                        # R-squared
-                        y_pred = X_with_const @ beta_hat
-                        ss_res = np.sum((y - y_pred) ** 2)
-                        ss_tot = np.sum((y - y.mean()) ** 2)
-                        r_squared = 1 - (ss_res / ss_tot) if ss_tot > 0 else 0
-                        
-                        # Display metrics
-                        col1, col2, col3 = st.columns(3)
-                        with col1:
-                            st.metric("Alpha (annualized)", f"{alpha_daily*TRADING_DAYS:.2%}")
-                        with col2:
-                            st.metric("Beta", f"{beta_val:.3f}")
-                        with col3:
-                            st.metric("R-squared", f"{r_squared:.3f}")
-                        
-                        # Scatter plot
-                        fig_capm = go.Figure()
-                        fig_capm.add_trace(go.Scatter(
-                            x=bench_excess,
-                            y=asset_excess,
-                            mode='markers',
-                            marker=dict(size=5, opacity=0.5, color='steelblue'),
-                            name='Actual Returns',
-                            hovertemplate='Market Excess: %{x:.4f}<br>Asset Excess: %{y:.4f}<extra></extra>'
-                        ))
-                        
-                        # Regression line
-                        x_line = np.array([bench_excess.min(), bench_excess.max()])
-                        y_line = alpha_daily + beta_val * x_line
-                        fig_capm.add_trace(go.Scatter(
-                            x=x_line,
-                            y=y_line,
-                            mode='lines',
-                            line=dict(color='red', width=2),
-                            name=f"CAPM: α={alpha_daily*TRADING_DAYS:.2%}, β={beta_val:.3f}",
-                            hovertemplate='Regression Line<extra></extra>'
-                        ))
-                        
-                        fig_capm.update_layout(
-                            title=f"CAPM Regression: {selected_asset} vs {benchmark}",
-                            xaxis_title=f"{benchmark} Excess Return (daily)",
-                            yaxis_title=f"{selected_asset} Excess Return (daily)",
-                            height=450,
-                            margin=dict(l=10, r=10, t=40, b=10),
-                            hovermode='closest'
-                        )
-                        st.plotly_chart(fig_capm)
-                    else:
-                        st.warning(f"Not enough overlapping data between {selected_asset} and {benchmark}")
-                except Exception as e:
-                    st.error(f"Error analyzing {selected_asset}: {str(e)}")
-            else:
-                st.warning(f"Benchmark {benchmark} not available")
+    st.plotly_chart(fig_w, use_container_width=True)
 
     st.subheader("Betas & Matrices")
-    
+    if betas is not None:
+        beta_df = pd.DataFrame({"Asset": betas.index, f"Beta vs {benchmark}": betas.values})
+        beta_df = beta_df.sort_values(f"Beta vs {benchmark}", ascending=False).reset_index(drop=True)
+        st.write("**Betas**")
+        st.dataframe(beta_df, width='stretch', height=200)
+    else:
+        st.info("Betas not available (benchmark download failed or not enough overlap).")
+
+    st.write("**Selected Asset CAPM Scatter**")
+    if capm_df is not None and not capm_df.empty and not bench_prices.empty:
+        capm_table = capm_df.copy()
+        capm_table["Alpha (annualized)"] = (1.0 + capm_table["Alpha (daily)"]) ** TRADING_DAYS - 1.0
+        capm_table = capm_table[["Asset", "Alpha (annualized)", "Beta", "R^2", "Corr (excess vs mkt)"]]
+        st.dataframe(capm_table, width='stretch', height=220)
+
+        asset_choice = st.selectbox("Asset", list(rets.columns), key="capm_asset_select")
+
+        rf_daily = (1.0 + float(rf)) ** (1.0 / TRADING_DAYS) - 1.0
+        bench_rets = bench_prices.pct_change().dropna().iloc[:, 0]
+        asset_rets = rets[asset_choice].dropna()
+
+        common_idx = asset_rets.index.intersection(bench_rets.index)
+        if len(common_idx) >= 60:
+            a = (asset_rets.loc[common_idx] - rf_daily).values
+            m = (bench_rets.loc[common_idx] - rf_daily).values
+
+            x = m
+            y = a
+            x_mean = float(np.mean(x))
+            y_mean = float(np.mean(y))
+            denom = float(np.sum((x - x_mean) ** 2))
+            beta = float(np.sum((x - x_mean) * (y - y_mean)) / denom) if denom > 1e-12 else 0.0
+            alpha = float(y_mean - beta * x_mean)
+            corr = float(np.corrcoef(x, y)[0, 1]) if len(x) > 1 else np.nan
+            r2 = float(corr ** 2) if np.isfinite(corr) else np.nan
+
+            x_line = np.linspace(np.min(x), np.max(x), 60)
+            y_line = alpha + beta * x_line
+
+            sel_fig = go.Figure()
+            sel_fig.add_trace(
+                go.Scatter(
+                    x=x,
+                    y=y,
+                    mode="markers",
+                    marker=dict(size=7, color="rgba(31, 119, 180, 0.6)"),
+                    name="Daily excess returns",
+                    hovertemplate=
+                        f"<b>{asset_choice}</b><br>Excess mkt: %{{x:.2%}}<br>Excess asset: %{{y:.2%}}<extra></extra>",
+                )
+            )
+            sel_fig.add_trace(
+                go.Scatter(
+                    x=x_line,
+                    y=y_line,
+                    mode="lines",
+                    line=dict(color="orange", width=2),
+                    name="CAPM fit",
+                    hovertemplate="CAPM fit<extra></extra>",
+                )
+            )
+            sel_fig.update_layout(
+                height=360,
+                margin=dict(l=10, r=10, t=40, b=10),
+                xaxis_title=f"{benchmark} Excess Return (daily)",
+                yaxis_title=f"{asset_choice} Excess Return (daily)",
+                title=f"{asset_choice}: α={alpha:.4%}, β={beta:.2f}, R²={r2:.2f}",
+            )
+            st.plotly_chart(sel_fig, use_container_width=True)
+        else:
+            st.info("Not enough overlapping data to plot selected asset CAPM scatter.")
+    else:
+        st.info("Select assets and benchmark with sufficient data to view CAPM scatter.")
+
     show_corr = st.checkbox("Show correlation (instead of covariance)", value=False)
     mat = corr_matrix if show_corr else cov_matrix
     title = "Correlation Heatmap" if show_corr else "Covariance Heatmap (annualized)"
     cbar = "Corr" if show_corr else "Cov"
 
     st.dataframe(mat, width='stretch', height=250)
-    fig_mat = go.Figure(data=go.Heatmap(z=mat.values, x=mat.columns, y=mat.index, colorscale="Reds", colorbar=dict(title=cbar)))
+    fig_mat = go.Figure(data=go.Heatmap(
+        z=mat.values,
+        x=mat.columns,
+        y=mat.index,
+        colorscale="RdBu",
+        zmid=0,
+        colorbar=dict(title=cbar),
+    ))
     fig_mat.update_layout(height=320, margin=dict(l=10, r=10, t=40, b=10), title=title)
-    st.plotly_chart(fig_mat, config={'responsive': True})
+    st.plotly_chart(fig_mat, use_container_width=True)
 
 with tab2:
     st.subheader("Cumulative Returns (Base = 100)")
@@ -825,7 +752,7 @@ with tab2:
     for t in cum_returns.columns:
         fig_ret.add_trace(go.Scatter(x=cum_returns.index, y=cum_returns[t], mode="lines", name=t))
     fig_ret.update_layout(height=360, margin=dict(l=10, r=10, t=40, b=10), yaxis_title="Growth of 100")
-    st.plotly_chart(fig_ret, config={'responsive': True})
+    st.plotly_chart(fig_ret, use_container_width=True)
 
     st.subheader("Frontier (risky-only) + CML (if enabled)")
     fig = go.Figure()
@@ -854,7 +781,7 @@ with tab2:
         xaxis_title="Annualized Volatility",
         yaxis_title="Annualized Return",
     )
-    st.plotly_chart(fig, config={'responsive': True})
+    st.plotly_chart(fig, use_container_width=True)
 
 # ======================================================================
 # CHAT — Top-level (required by Streamlit) + actionable commands
@@ -863,9 +790,10 @@ st.markdown("---")
 st.markdown(
     """
     <div class="chat-card">
-        <div class="chat-title">Portfolio Assistant</div>
+        <div class="chat-title">💬 Portfolio Assistant</div>
         <div class="chat-hint">
-            Try: "explain" for complete summary • "I want to be capped at 15% risk" • "Explain allocations".
+            Try: “I want to be capped at 15% risk” → then “Explain allocations and correlation”.
+            Out-of-scope (e.g., weather) will be refused safely.
         </div>
     </div>
     """,
@@ -873,16 +801,14 @@ st.markdown(
 )
 
 # quick prompts
-q1, q2, q3, q4, q5 = st.columns(5)
-if q1.button("Explain"):
-    st.session_state.prefill = "explain"
-if q2.button("Cap at 15% risk"):
+q1, q2, q3, q4 = st.columns(4)
+if q1.button("Cap at 15% risk"):
     st.session_state.prefill = "I want to be capped at 15% risk"
-if q3.button("Explain allocations"):
+if q2.button("Explain allocations"):
     st.session_state.prefill = "Explain allocations"
-if q4.button("Explain correlation"):
+if q3.button("Explain correlation"):
     st.session_state.prefill = "Explain correlation"
-if q5.button("Explain betas"):
+if q4.button("Explain betas"):
     st.session_state.prefill = "Explain betas"
 
 if "chat" not in st.session_state:
