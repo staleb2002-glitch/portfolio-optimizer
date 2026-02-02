@@ -18,6 +18,8 @@ CSS = """
 .small-muted { color: rgba(0,0,0,0.55); font-size: 0.9rem; }
 .kpi { font-size: 1.05rem; font-weight: 700; margin: 0; }
 .kpi-sub { color: rgba(0,0,0,0.55); font-size: 0.85rem; margin: 0; }
+.kpi-amount { font-size: 0.95rem; font-weight: 700; margin: 0; white-space: nowrap; }
+.kpi-amount-label { color: rgba(0,0,0,0.55); font-size: 0.8rem; margin: 0; }
 hr { border-color: rgba(0,0,0,0.1); }
 </style>
 """
@@ -355,11 +357,18 @@ def safe_assistant(user_msg: str, ctx: dict) -> str:
         top = wdf.head(6)
         w_lines = "\n".join([f"- {r['Asset']}: **{r['Weight']:.1%}**" for _, r in top.iterrows()])
         corr_text = explain_correlation(wdf, ctx.get("corr_matrix"), top_n=4)
+        invest_amt = float(ctx.get("investment_amount") or 0.0)
+        exp_dollars = ctx.get("expected_return_dollars")
+        curr = ctx.get("currency_choice", "USD")
+        dollars_line = ""
+        if invest_amt > 0 and exp_dollars is not None:
+            dollars_line = f"- Expected annual return on {invest_amt:,.2f} {curr}: **{float(exp_dollars):,.2f} {curr}**\n"
 
         return (
             f"**Portfolio summary**\n"
             f"- Selected: **{ctx.get('selected_label','')}**\n"
             f"- Expected return (annual): **{ctx.get('port_r'):.2%}**\n"
+            f"{dollars_line}"
             f"- Volatility (annual): **{ctx.get('port_v'):.2%}**\n"
             f"- Sharpe (vs rf): **{ctx.get('port_s'):.2f}**\n\n"
             f"**Top allocations**\n{w_lines}\n\n{corr_text}"
@@ -427,6 +436,10 @@ with st.sidebar:
     st.markdown('<div class="sidebar-section"><div class="section-label">Constraints</div></div>', unsafe_allow_html=True)
     long_only = st.checkbox("Long-only (no shorting)", value=True)
     max_w = st.slider("Max weight per asset", 0.10, 1.00, 1.00, 0.05)
+
+    st.markdown('<div class="sidebar-section"><div class="section-label">Capital Allocation</div></div>', unsafe_allow_html=True)
+    currency_choice = st.selectbox("Currency", ["USD", "EUR", "GBP", "CAD", "AUD", "JPY"], index=0)
+    investment_amount = st.number_input("Investment amount ($)", min_value=0.0, value=10000.0, step=100.0, format="%.2f")
 
     st.markdown('<div class="sidebar-section"><div class="section-label">Engine</div></div>', unsafe_allow_html=True)
     use_cvxpy = st.checkbox("Use true optimizer (cvxpy when available)", value=True)
@@ -609,6 +622,9 @@ try:
         "port_v": port_v,
         "port_s": port_s,
         "weights_df": weights_df,
+        "investment_amount": float(investment_amount),
+        "expected_return_dollars": float(investment_amount) * float(port_r),
+        "currency_choice": currency_choice,
         "betas": betas,
         "capm_df": capm_df,
         "benchmark": benchmark,
@@ -626,7 +642,7 @@ except Exception as e:
 # =========================
 max_sharpe_cloud = float(np.nanmax(sharpe_cloud)) if len(sharpe_cloud) > 0 else np.nan
 st.markdown("### Key Metrics")
-k1, k2, k3, k4, k5 = st.columns(5)
+k1, k2, k3, k4, k5, k6 = st.columns(6)
 with k1:
     st.metric("Expected Return", f"{port_r:.2%}")
 with k2:
@@ -636,6 +652,13 @@ with k3:
 with k4:
     st.metric("Max Sharpe", f"{max_sharpe_cloud:.2f}")
 with k5:
+    expected_return_value = float(investment_amount) * float(port_r)
+    st.markdown(
+        f"<div class=\"kpi-amount\">{expected_return_value:,.2f} {currency_choice}</div>"
+        f"<div class=\"kpi-amount-label\">Expected Return ({currency_choice})</div>",
+        unsafe_allow_html=True,
+    )
+with k6:
     st.info(f"📋 {selected_label}")
 
 st.markdown("---")
@@ -653,6 +676,15 @@ with tab1:
     fig_w.add_trace(go.Bar(x=weights_df["Asset"], y=weights_df["Weight"]))
     fig_w.update_layout(height=290, margin=dict(l=10, r=10, t=40, b=10), yaxis_title="Weight", title="Allocation")
     st.plotly_chart(fig_w, use_container_width=True)
+
+    if investment_amount > 0:
+        st.subheader("Capital Allocation")
+        expected_return_dollars = float(investment_amount) * float(port_r)
+        st.metric(f"Expected Annual Return ({currency_choice})", f"{expected_return_dollars:,.2f} {currency_choice}")
+
+        alloc_df = weights_df.copy()
+        alloc_df[f"Allocation ({currency_choice})"] = alloc_df["Weight"] * float(investment_amount)
+        st.dataframe(alloc_df, width='stretch', height=240)
 
     st.subheader("Betas & Matrices")
     if betas is not None:
@@ -735,16 +767,6 @@ with tab1:
     cbar = "Corr" if show_corr else "Cov"
 
     st.dataframe(mat, width='stretch', height=250)
-    fig_mat = go.Figure(data=go.Heatmap(
-        z=mat.values,
-        x=mat.columns,
-        y=mat.index,
-        colorscale="RdBu",
-        zmid=0,
-        colorbar=dict(title=cbar),
-    ))
-    fig_mat.update_layout(height=320, margin=dict(l=10, r=10, t=40, b=10), title=title)
-    st.plotly_chart(fig_mat, use_container_width=True)
 
 with tab2:
     st.subheader("Cumulative Returns (Base = 100)")
