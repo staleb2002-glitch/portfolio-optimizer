@@ -1,11 +1,13 @@
 import os
 import re
 import json
+import tempfile
 import numpy as np
 import pandas as pd
 import streamlit as st
 import yfinance as yf
 import plotly.graph_objects as go
+from portfolio_report import generate_portfolio_report
 
 TRADING_DAYS = 252
 
@@ -662,6 +664,100 @@ with k6:
     st.info(f"📋 {selected_label}")
 
 st.markdown("---")
+
+# =========================
+# PDF Report Download
+# =========================
+def _build_report_data() -> dict:
+    """Assemble report_data dict from current optimizer state."""
+    # Performance: compute period returns from prices
+    perf = {}
+    total_days = len(prices)
+    if total_days > 21:
+        r1m = float((prices.iloc[-1] / prices.iloc[-22]).mean() - 1)
+        perf["1M"] = r1m
+    first_of_year = prices.loc[prices.index >= pd.Timestamp(prices.index[-1].year, 1, 1)]
+    if len(first_of_year) > 1:
+        perf["YTD"] = float((first_of_year.iloc[-1] / first_of_year.iloc[0]).mean() - 1)
+    if total_days > 252:
+        perf["1Y"] = float((prices.iloc[-1] / prices.iloc[-253]).mean() - 1)
+    perf["Since Inception"] = float((prices.iloc[-1] / prices.iloc[0]).mean() - 1)
+
+    # Holdings table
+    h_df = weights_df.copy()
+    h_df.columns = ["Ticker", "Weight"]
+    h_df["Market Value"] = h_df["Weight"] * float(investment_amount)
+    h_df["P/L"] = h_df["Market Value"] * float(port_r)
+
+    # Weighted portfolio cumulative returns
+    w_risky_only = weights_df[weights_df["Asset"] != "RISK-FREE"].copy()
+    port_daily = pd.Series(0.0, index=rets.index)
+    for _, row in w_risky_only.iterrows():
+        asset = row["Asset"]
+        wgt = float(row["Weight"])
+        if asset in rets.columns:
+            port_daily = port_daily + rets[asset] * wgt
+    port_cum = (1 + port_daily).cumprod() * 100
+
+    # Benchmark cumulative
+    bench_cum = None
+    try:
+        if not bench_prices.empty:
+            b_rets = bench_prices.pct_change().dropna().iloc[:, 0]
+            common = port_daily.index.intersection(b_rets.index)
+            if len(common) > 10:
+                bench_cum = (1 + b_rets.loc[common]).cumprod() * 100
+    except Exception:
+        pass
+
+    # Max drawdown
+    running_max = port_cum.cummax()
+    drawdown = (port_cum - running_max) / running_max
+    max_dd = float(drawdown.min()) if len(drawdown) > 0 else 0.0
+
+    return {
+        "client_name": "Portfolio Optimizer Client",
+        "report_date": pd.Timestamp.today().strftime("%Y-%m-%d"),
+        "portfolio_value": float(investment_amount),
+        "currency": currency_choice,
+        "performance": perf,
+        "risk": {
+            "Volatility": float(port_v),
+            "Sharpe": float(port_s),
+            "Max Drawdown": max_dd,
+        },
+        "weights": {
+            row["Asset"]: float(row["Weight"])
+            for _, row in weights_df.iterrows()
+        },
+        "holdings_df": h_df,
+        "portfolio_series": port_cum,
+        "benchmark_series": bench_cum,
+        "portfolio_label": selected_label,
+        "benchmark_label": benchmark,
+        "commentary": [
+            f"Strategy: {selected_label}. "
+            f"Expected annual return {port_r:.2%} with {port_v:.2%} volatility (Sharpe {port_s:.2f}).",
+            f"Assets analyzed over {start} – {end}. "
+            f"Risk-free rate assumed at {rf:.2%} annually. "
+            f"Benchmark: {benchmark}.",
+        ],
+    }
+
+if st.button("📄 Download PDF Report"):
+    with st.spinner("Generating report…"):
+        rd = _build_report_data()
+        tmp = tempfile.NamedTemporaryFile(suffix=".pdf", delete=False)
+        generate_portfolio_report(rd, tmp.name)
+        with open(tmp.name, "rb") as f:
+            pdf_bytes = f.read()
+        os.unlink(tmp.name)
+    st.download_button(
+        label="⬇️ Save Report PDF",
+        data=pdf_bytes,
+        file_name=f"portfolio_report_{pd.Timestamp.today().strftime('%Y%m%d')}.pdf",
+        mime="application/pdf",
+    )
 
 # =========================
 # Two-tab layout
