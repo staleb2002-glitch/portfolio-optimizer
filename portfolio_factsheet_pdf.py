@@ -418,6 +418,8 @@ def _page1(c: canvas.Canvas, rd: dict):
     facts = [
         ("Portfolio Value", f"{pv:,.2f} {currency}" if pv else "N/A"),
         ("Report Date", report_date),
+        ("Inception Date", rd.get("inception_date", "N/A")),
+        ("No. of Holdings", str(rd.get("num_holdings", "N/A"))),
         ("Strategy", rd.get("portfolio_label", "N/A")),
         ("Benchmark", rd.get("benchmark_label", "N/A")),
         ("Currency", currency),
@@ -433,7 +435,7 @@ def _page1(c: canvas.Canvas, rd: dict):
     perf = rd.get("performance", {})
     perf_headers = ["Period", "Return"]
     perf_rows = []
-    for period in ["1M", "YTD", "1Y", "Since Inception"]:
+    for period in ["1M", "YTD", "1Y", "3Y Ann.", "5Y Ann.", "Since Inception"]:
         ret = perf.get(period)
         if ret is not None and isinstance(ret, (int, float)):
             perf_rows.append([period, f"{ret:+.2%}"])
@@ -538,6 +540,18 @@ def _page2(c: canvas.Canvas, rd: dict):
     else:
         y -= 20
 
+    # ── Calendar Year Returns ──
+    cal_year = rd.get("calendar_year_returns", {})
+    if cal_year:
+        y = _draw_section_heading(c, MARGIN_L, y, "Calendar Year Returns")
+        cal_headers = ["Year", "Return"]
+        cal_rows = [[yr, f"{ret:+.2%}"] for yr, ret in sorted(cal_year.items(), reverse=True)]
+        cw_cal = [CONTENT_W * 0.45, CONTENT_W * 0.55]
+        y = _draw_table(c, MARGIN_L, y, cal_headers, cal_rows,
+                        col_widths=cw_cal, col_aligns=["LEFT", "RIGHT"],
+                        font_size=8.5, row_height=17)
+        y -= 10
+
     # ── Portfolio Risk Metrics ──
     y = _draw_section_heading(c, MARGIN_L, y, "Risk Metrics")
 
@@ -555,8 +569,13 @@ def _page2(c: canvas.Canvas, rd: dict):
         "Sortino Ratio": lambda v: f"{v:.2f}",
         "Tracking Error": lambda v: f"{v:.2%}",
         "Information Ratio": lambda v: f"{v:.2f}",
+        "Alpha": lambda v: f"{v:.2%}",
+        "R-Squared": lambda v: f"{v:.2f}",
+        "R²": lambda v: f"{v:.2f}",
     }
     for metric, val in risk.items():
+        if val is None:
+            continue
         if isinstance(val, (int, float)):
             fmt_fn = metric_map.get(metric, lambda v: f"{v:.4f}")
             risk_rows.append([metric, fmt_fn(val)])

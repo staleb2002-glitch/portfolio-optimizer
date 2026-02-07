@@ -701,6 +701,45 @@ try:
     n_years = len(rets) / TRADING_DAYS
     total_return_cash = float(investment_amount) * total_period_return
 
+    # ── Additional risk metrics ──
+    # Max drawdown
+    port_cum = (1 + port_daily_rets).cumprod()
+    running_max = port_cum.cummax()
+    drawdown_series = (port_cum - running_max) / running_max
+    max_drawdown = float(drawdown_series.min()) if len(drawdown_series) > 0 else 0.0
+
+    # Sortino Ratio (downside deviation)
+    rf_daily = (1.0 + float(rf)) ** (1.0 / TRADING_DAYS) - 1.0
+    excess_daily = port_daily_rets - rf_daily
+    downside = excess_daily[excess_daily < 0]
+    downside_std = float(np.sqrt((downside ** 2).mean()) * np.sqrt(TRADING_DAYS)) if len(downside) > 0 else np.nan
+    sortino_ratio = float((port_r - rf) / downside_std) if downside_std > 1e-12 else np.nan
+
+    # Tracking Error & Information Ratio (vs benchmark)
+    tracking_error = np.nan
+    information_ratio = np.nan
+    port_alpha = np.nan
+    port_beta = np.nan
+    port_r_squared = np.nan
+    if not bench_prices.empty:
+        bench_rets_daily = bench_prices.pct_change().dropna().iloc[:, 0]
+        common_idx_te = port_daily_rets.index.intersection(bench_rets_daily.index)
+        if len(common_idx_te) >= 60:
+            active_rets = port_daily_rets.loc[common_idx_te] - bench_rets_daily.loc[common_idx_te]
+            tracking_error = float(active_rets.std() * np.sqrt(TRADING_DAYS))
+            information_ratio = float(active_rets.mean() * TRADING_DAYS / tracking_error) if tracking_error > 1e-12 else np.nan
+            # Portfolio-level Alpha, Beta, R²
+            bx = (bench_rets_daily.loc[common_idx_te] - rf_daily).values
+            by = (port_daily_rets.loc[common_idx_te] - rf_daily).values
+            bx_mean = float(np.mean(bx))
+            by_mean = float(np.mean(by))
+            denom_b = float(np.sum((bx - bx_mean) ** 2))
+            port_beta = float(np.sum((bx - bx_mean) * (by - by_mean)) / denom_b) if denom_b > 1e-12 else 0.0
+            port_alpha_daily = float(by_mean - port_beta * bx_mean)
+            port_alpha = float((1 + port_alpha_daily) ** TRADING_DAYS - 1)
+            _corr = float(np.corrcoef(bx, by)[0, 1]) if len(bx) > 1 else np.nan
+            port_r_squared = float(_corr ** 2) if np.isfinite(_corr) else np.nan
+
     # Save context for chat responses
     st.session_state.app_context = {
         "selected_label": selected_label,
@@ -720,6 +759,13 @@ try:
         "benchmark": benchmark,
         "cov_matrix": cov_matrix,
         "corr_matrix": corr_matrix,
+        "max_drawdown": max_drawdown,
+        "sortino_ratio": sortino_ratio,
+        "tracking_error": tracking_error,
+        "information_ratio": information_ratio,
+        "port_alpha": port_alpha,
+        "port_beta": port_beta,
+        "port_r_squared": port_r_squared,
     }
 
 except Exception as e:
@@ -759,6 +805,21 @@ with k7:
 with k8:
     st.info(f"📋 {selected_label}")
 
+# Second row of KPIs
+k9, k10, k11, k12, k13, k14 = st.columns(6)
+with k9:
+    st.metric("Sortino", f"{sortino_ratio:.2f}" if np.isfinite(sortino_ratio) else "N/A")
+with k10:
+    st.metric("Max Drawdown", f"{max_drawdown:.2%}")
+with k11:
+    st.metric("Tracking Error", f"{tracking_error:.2%}" if np.isfinite(tracking_error) else "N/A")
+with k12:
+    st.metric("Info Ratio", f"{information_ratio:.2f}" if np.isfinite(information_ratio) else "N/A")
+with k13:
+    st.metric(f"Alpha vs {benchmark}", f"{port_alpha:.2%}" if np.isfinite(port_alpha) else "N/A")
+with k14:
+    st.metric(f"Beta vs {benchmark}", f"{port_beta:.2f}" if np.isfinite(port_beta) else "N/A")
+
 st.markdown("---")
 
 # =========================
@@ -786,7 +847,22 @@ def _build_report_data() -> dict:
         perf["YTD"] = float(first_of_year.iloc[-1] / first_of_year.iloc[0] - 1)
     if total_days > 252:
         perf["1Y"] = float(port_cum.iloc[-1] / port_cum.iloc[-253] - 1)
+    # 3Y and 5Y annualized
+    if total_days > 252 * 3:
+        cum_3y = float(port_cum.iloc[-1] / port_cum.iloc[-252 * 3] - 1)
+        perf["3Y Ann."] = float((1 + cum_3y) ** (1 / 3) - 1)
+    if total_days > 252 * 5:
+        cum_5y = float(port_cum.iloc[-1] / port_cum.iloc[-252 * 5] - 1)
+        perf["5Y Ann."] = float((1 + cum_5y) ** (1 / 5) - 1)
     perf["Since Inception"] = float(port_cum.iloc[-1] / port_cum.iloc[0] - 1)
+
+    # Calendar year returns
+    cal_year_returns = {}
+    port_cum_idx = port_cum.copy()
+    for yr in sorted(port_cum_idx.index.year.unique()):
+        yr_data = port_cum_idx.loc[port_cum_idx.index.year == yr]
+        if len(yr_data) > 1:
+            cal_year_returns[str(yr)] = float(yr_data.iloc[-1] / yr_data.iloc[0] - 1)
 
     # Scale cumulative to base 100 for chart
     port_cum_chart = port_cum * 100
@@ -859,9 +935,18 @@ def _build_report_data() -> dict:
         "performance": perf,
         "risk": {
             "Volatility": float(port_v),
-            "Sharpe": float(port_s),
-            "Max Drawdown": max_dd,
+            "Sharpe Ratio": float(port_s),
+            "Sortino Ratio": float(sortino_ratio) if np.isfinite(sortino_ratio) else None,
+            "Max Drawdown": max_drawdown,
+            "Tracking Error": float(tracking_error) if np.isfinite(tracking_error) else None,
+            "Information Ratio": float(information_ratio) if np.isfinite(information_ratio) else None,
+            "Alpha": float(port_alpha) if np.isfinite(port_alpha) else None,
+            "Beta": float(port_beta) if np.isfinite(port_beta) else None,
+            "R-Squared": float(port_r_squared) if np.isfinite(port_r_squared) else None,
         },
+        "calendar_year_returns": cal_year_returns,
+        "inception_date": str(start),
+        "num_holdings": len([w for w in weights_df["Weight"] if abs(float(w)) > 0.001]),
         "weights": {
             row["Asset"]: float(row["Weight"])
             for _, row in weights_df.iterrows()
