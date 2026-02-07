@@ -56,7 +56,7 @@ def download_close_prices(tickers, start, end):
         prices = raw[["Close"]].rename(columns={"Close": tickers[0]})
 
     prices = prices.dropna(how="all")
-    prices = prices.ffill()          # fill exchange-holiday gaps with last close
+    prices = prices.ffill().bfill()  # fill gaps: ffill for holidays, bfill for late-start tickers
     prices = prices.dropna(axis=1, how="any")  # drop tickers still missing data
     return prices
 
