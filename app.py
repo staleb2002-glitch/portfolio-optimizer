@@ -472,17 +472,26 @@ with st.sidebar:
     }
 
     custom_weights_input = {}
+    custom_rf_weight = 0.0
     if portfolio_strategy == "Custom Allocation":
         st.markdown("**Set weight for each asset (%)**")
         n_assets = len(tickers)
-        default_equal = round(100.0 / max(n_assets, 1), 1)
+        if include_rf:
+            default_equal = round(100.0 / max(n_assets + 1, 1), 1)
+            custom_rf_weight = st.number_input(
+                "RISK-FREE %", min_value=0.0, max_value=100.0,
+                value=default_equal,
+                step=0.5, key="cw_RISK_FREE"
+            )
+        else:
+            default_equal = round(100.0 / max(n_assets, 1), 1)
         for tk in tickers:
             custom_weights_input[tk] = st.number_input(
                 f"{tk} %", min_value=0.0, max_value=100.0,
                 value=_DEFAULT_WEIGHTS.get(tk, default_equal),
                 step=0.5, key=f"cw_{tk}"
             )
-        total_pct = sum(custom_weights_input.values())
+        total_pct = sum(custom_weights_input.values()) + custom_rf_weight
         if abs(total_pct - 100.0) > 0.5:
             st.warning(f"⚠️ Weights sum to {total_pct:.1f}% — they should add up to 100%.")
     
@@ -622,17 +631,40 @@ try:
             weights_df = pd.DataFrame({"Asset": list(prices.columns), "Weight": list(w_min)})
 
     elif active_strategy == "Custom Allocation" and custom_weights_input:
-        # User-defined weights
-        total_pct = sum(custom_weights_input.values())
-        w_custom = np.array([custom_weights_input.get(t, 0.0) for t in prices.columns])
+        # User-defined weights (risky assets + optional risk-free)
+        total_pct = sum(custom_weights_input.values()) + custom_rf_weight
+        w_raw = np.array([custom_weights_input.get(t, 0.0) for t in prices.columns])
+        w_rf_raw = custom_rf_weight
         if total_pct > 0:
-            w_custom = w_custom / w_custom.sum()   # normalise to 1
+            scale = 1.0 / total_pct  # normalise percentages to fractions summing to 1
+            w_custom = w_raw * scale
+            w_rf = w_rf_raw * scale
         else:
-            w_custom = np.ones(len(prices.columns)) / len(prices.columns)
-        port_r, port_v = portfolio_metrics_risky(w_custom, mu, cov)
-        port_s = (port_r - rf) / port_v if port_v > 0 else np.nan
-        selected_label = "Custom Allocation"
-        weights_df = pd.DataFrame({"Asset": list(prices.columns), "Weight": list(w_custom)})
+            w_custom = np.ones(len(prices.columns)) / (len(prices.columns) + (1 if include_rf else 0))
+            w_rf = 1.0 / (len(prices.columns) + 1) if include_rf else 0.0
+
+        if include_rf and w_rf > 1e-9:
+            # Blend: portfolio return = w_rf * rf + (1 - w_rf) * risky_return
+            alpha = 1.0 - w_rf  # fraction in risky assets
+            w_risky_normed = w_custom / w_custom.sum() if w_custom.sum() > 1e-12 else w_custom
+            port_r_risky, port_v_risky = portfolio_metrics_risky(w_risky_normed, mu, cov)
+            port_r = w_rf * rf + alpha * port_r_risky
+            port_v = alpha * port_v_risky
+            port_s = (port_r - rf) / port_v if port_v > 0 else np.nan
+            selected_label = f"Custom Allocation (RF {w_rf:.0%})"
+            weights_df = pd.DataFrame(
+                {"Asset": ["RISK-FREE"] + list(prices.columns),
+                 "Weight": [w_rf] + list(w_custom)}
+            )
+        else:
+            if w_raw.sum() > 0:
+                w_custom = w_raw / w_raw.sum()
+            else:
+                w_custom = np.ones(len(prices.columns)) / len(prices.columns)
+            port_r, port_v = portfolio_metrics_risky(w_custom, mu, cov)
+            port_s = (port_r - rf) / port_v if port_v > 0 else np.nan
+            selected_label = "Custom Allocation"
+            weights_df = pd.DataFrame({"Asset": list(prices.columns), "Weight": list(w_custom)})
 
     else:  # Max Sharpe (default)
         if include_rf:
