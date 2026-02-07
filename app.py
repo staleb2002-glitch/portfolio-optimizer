@@ -1,5 +1,4 @@
 import os
-import re
 import json
 import tempfile
 import numpy as np
@@ -35,7 +34,7 @@ st.markdown(CSS, unsafe_allow_html=True)
 
 # Header
 st.write(
-        '<span class="small-muted">Cumulative returns · Frontier + CML · Cov/Cor matrices · Betas · Actionable chat</span>',
+        '<span class="small-muted">Cumulative returns · Frontier + CML · Cov/Cor matrices · Betas</span>',
         unsafe_allow_html=True,
 )
 
@@ -264,163 +263,12 @@ def compute_capm_metrics(
     return df
 
 
-# ---------------- Chat: parsing + safe assistant ----------------
-OUT_OF_SCOPE_TERMS = [
-    "weather", "temperature", "forecast", "rain", "snow",
-    "news", "politics", "sports", "flight", "restaurant",
-]
-
-def parse_target_vol(user_msg: str):
-    """
-    Extract target risk/volatility from phrases like:
-      - "capped at 15% risk"
-      - "target vol 12%"
-      - "volatility 0.20"
-    Returns decimal (0.15) or None.
-    """
-    msg = user_msg.lower()
-
-    # percent form
-    m = re.search(r"(\d+(?:\.\d+)?)\s*%\s*(risk|vol|volatility)", msg)
-    if not m:
-        m = re.search(r"(risk|vol|volatility)\s*(cap|capped|target)?\s*at?\s*(\d+(?:\.\d+)?)\s*%", msg)
-        if m:
-            val = float(m.group(3)) / 100.0
-            return val if 0.01 <= val <= 2.0 else None
-        return None
-
-    val = float(m.group(1)) / 100.0
-    return val if 0.01 <= val <= 2.0 else None
-
-
-def explain_correlation(weights_df: pd.DataFrame, corr_matrix: pd.DataFrame, top_n: int = 4) -> str:
-    if corr_matrix is None or corr_matrix.empty:
-        return "Correlation matrix is not available."
-
-    assets = [a for a in weights_df["Asset"].tolist() if a != "RISK-FREE"]
-    if len(assets) < 2:
-        return "Not enough risky assets to discuss correlation."
-
-    w = weights_df[weights_df["Asset"] != "RISK-FREE"].copy()
-    w = w.sort_values("Weight", ascending=False).head(top_n)
-    top_assets = w["Asset"].tolist()
-
-    pairs = []
-    for i in range(len(top_assets)):
-        for j in range(i + 1, len(top_assets)):
-            a, b = top_assets[i], top_assets[j]
-            if a in corr_matrix.index and b in corr_matrix.columns:
-                pairs.append((a, b, float(corr_matrix.loc[a, b])))
-
-    pairs.sort(key=lambda x: abs(x[2]), reverse=True)
-
-    m = corr_matrix.copy()
-    np.fill_diagonal(m.values, np.nan)
-    avg_corr = float(np.nanmean(m.values))
-
-    lines = []
-    for a, b, c in pairs[:5]:
-        lines.append(f"- Corr({a}, {b}) = **{c:.2f}**")
-
-    return (
-        f"**Diversification / Correlation**\n"
-        f"- Average pairwise correlation ≈ **{avg_corr:.2f}** (lower usually means better diversification)\n"
-        f"- Strongest relationships among top weights:\n" + ("\n".join(lines) if lines else "- (not enough data)")
-    )
-
-
-def safe_assistant(user_msg: str, ctx: dict) -> str:
-    """
-    Non-hallucinating assistant:
-      - If user asks out-of-scope (e.g. weather), refuses safely.
-      - If user asks for risk cap/target vol, it triggers an app action.
-      - Otherwise answers only from ctx (weights/corr/betas/metrics).
-    """
-    msg = user_msg.strip()
-    low = msg.lower()
-
-    # Out of scope guard
-    if any(t in low for t in OUT_OF_SCOPE_TERMS):
-        return (
-            "I can’t answer that reliably from this portfolio app (no external data source connected).\n\n"
-            "I *can* help with:\n"
-            "- Target risk/volatility portfolios (e.g., “cap me at 15% risk”)\n"
-            "- Explaining weights, Sharpe, betas, covariance/correlation, diversification\n"
-            "- Interpreting the frontier and Risk-Free (CML) mix"
-        )
-
-    # Action: target volatility
-    target = parse_target_vol(msg)
-    if target is not None:
-        st.session_state.ai_target_vol = float(target)
-        st.session_state.ai_action = "target_vol"
-        return f"✅ Done. I’ll cap your risk at **{target:.0%} volatility**. I’m recomputing the portfolio now…"
-
-    # If ctx missing, refuse
-    if not ctx or "weights_df" not in ctx:
-        return "I don’t have portfolio results available yet. Please select assets/dates first."
-
-    # Explanation intents
-    if any(k in low for k in ["allocation", "weights", "explain my results", "summary", "explain results"]):
-        wdf = ctx["weights_df"]
-        top = wdf.head(6)
-        w_lines = "\n".join([f"- {r['Asset']}: **{r['Weight']:.1%}**" for _, r in top.iterrows()])
-        corr_text = explain_correlation(wdf, ctx.get("corr_matrix"), top_n=4)
-        invest_amt = float(ctx.get("investment_amount") or 0.0)
-        exp_dollars = ctx.get("expected_return_dollars")
-        curr = ctx.get("currency_choice", "USD")
-        dollars_line = ""
-        if invest_amt > 0 and exp_dollars is not None:
-            dollars_line = f"- Expected annual return on {invest_amt:,.2f} {curr}: **{float(exp_dollars):,.2f} {curr}**\n"
-
-        return (
-            f"**Portfolio summary**\n"
-            f"- Selected: **{ctx.get('selected_label','')}**\n"
-            f"- Expected return (annual): **{ctx.get('port_r'):.2%}**\n"
-            f"{dollars_line}"
-            f"- Volatility (annual): **{ctx.get('port_v'):.2%}**\n"
-            f"- Sharpe (vs rf): **{ctx.get('port_s'):.2f}**\n\n"
-            f"**Top allocations**\n{w_lines}\n\n{corr_text}"
-        )
-
-    if "beta" in low:
-        betas = ctx.get("betas")
-        bench = ctx.get("benchmark", "SPY")
-        if betas is None:
-            return f"Betas are not available (benchmark {bench} failed to download or overlap was too short)."
-        s = betas.sort_values(ascending=False)
-        return (
-            f"**Betas vs {bench}** (market sensitivity)\n"
-            f"- Highest beta: **{s.index[0]}** (β={s.iloc[0]:.2f})\n"
-            f"- Lowest beta: **{s.index[-1]}** (β={s.iloc[-1]:.2f})\n"
-            "β>1 tends to move more than the market; β<1 is more defensive."
-        )
-
-    if any(k in low for k in ["correlation", "covariance", "diversified", "diversification"]):
-        return explain_correlation(ctx["weights_df"], ctx.get("corr_matrix"), top_n=4)
-
-    if "sharpe" in low:
-        return (
-            "Sharpe measures risk-adjusted performance: **(Return − rf) / Volatility**.\n"
-            f"Here: return={ctx.get('port_r'):.2%}, rf={ctx.get('rf'):.2%}, vol={ctx.get('port_v'):.2%} "
-            f"→ Sharpe={ctx.get('port_s'):.2f}."
-        )
-
-    return (
-        "I can help with portfolio results. Try:\n"
-        "- “I want to be capped at 15% risk”\n"
-        "- “Explain allocations and correlation”\n"
-        "- “Explain betas”\n"
-        "- “Am I diversified?”"
-    )
-
-
 # =========================
 # UI (Inputs)
 # =========================
 st.title("📈 Portfolio Optimizer")
 st.write(
-    '<span class="small-muted">Cumulative returns · Frontier + CML · Cov/Cor matrices · Betas · Actionable chat</span>',
+    '<span class="small-muted">Cumulative returns · Frontier + CML · Cov/Cor matrices · Betas</span>',
     unsafe_allow_html=True,
 )
 
@@ -498,11 +346,6 @@ with st.sidebar:
     # ---------------- Figma section ----------------
     # (no additional sidebar integrations)
 
-# Get OpenAI API key from environment
-OPENAI_API_KEY = os.getenv('OPENAI_API_KEY', '')
-if not OPENAI_API_KEY:
-    st.warning("⚠️ OPENAI_API_KEY not set. Set it as an environment variable to enable AI assistant.")
-
 # Guard
 if len(tickers) < 2:
     st.warning("Add at least **2 tickers**.")
@@ -558,17 +401,9 @@ try:
 
     r_tan, v_tan = portfolio_metrics_risky(w_tan, mu, cov)
 
-    # --------- ACTION OVERRIDE from chat (target volatility) ----------
-    ai_action = st.session_state.get("ai_action")
-    ai_target_vol = st.session_state.get("ai_target_vol")
-
-    # Determine portfolio strategy (AI action overrides, then user selection, then defaults)
+    # Determine portfolio strategy
     active_strategy = portfolio_strategy
     active_target_vol = target_vol_input
-    
-    if ai_action == "target_vol" and ai_target_vol is not None:
-        active_strategy = "Target Volatility"
-        active_target_vol = float(ai_target_vol)
     
     selected_label = f"{active_strategy}"
 
@@ -740,7 +575,7 @@ try:
             _corr = float(np.corrcoef(bx, by)[0, 1]) if len(bx) > 1 else np.nan
             port_r_squared = float(_corr ** 2) if np.isfinite(_corr) else np.nan
 
-    # Save context for chat responses
+    # Save context
     st.session_state.app_context = {
         "selected_label": selected_label,
         "rf": rf,
@@ -899,33 +734,13 @@ def _build_report_data() -> dict:
             _cml_r.append(float(_rr))
             _cml_v.append(float(_vv))
 
-    # AI-generated comprehensive commentary
-    _ai_ctx = {
-        "selected_label": selected_label,
-        "port_r": float(port_r),
-        "port_v": float(port_v),
-        "port_s": float(port_s),
-        "rf": float(rf),
-        "total_period_return": float(total_period_return),
-        "n_years": float(n_years),
-        "investment_amount": float(investment_amount),
-        "currency_choice": currency_choice,
-        "benchmark": benchmark,
-        "weights_df": weights_df,
-        "betas": betas,
-        "corr_matrix": corr_matrix,
-        "risk": {"Max Drawdown": max_dd},
-    }
-    try:
-        from app_ai_helpers import generate_ai_commentary
-        _commentary = generate_ai_commentary(_ai_ctx, OPENAI_API_KEY)
-    except Exception:
-        _commentary = [
-            f"Strategy: {selected_label}. "
-            f"Expected annual return {port_r:.2%} with {port_v:.2%} volatility (Sharpe {port_s:.2f}).",
-            f"Assets analyzed over {start} – {end}. "
-            f"Risk-free rate assumed at {rf:.2%} annually. Benchmark: {benchmark}.",
-        ]
+    # Auto-generated commentary
+    _commentary = [
+        f"Strategy: {selected_label}. "
+        f"Expected annual return {port_r:.2%} with {port_v:.2%} volatility (Sharpe {port_s:.2f}).",
+        f"Assets analyzed over {start} – {end}. "
+        f"Risk-free rate assumed at {rf:.2%} annually. Benchmark: {benchmark}.",
+    ]
 
     return {
         "client_name": "Portfolio Optimizer Client",
@@ -1231,93 +1046,3 @@ with tab2:
     )
     st.plotly_chart(fig, use_container_width=True)
 
-# ======================================================================
-# CHAT — Top-level (required by Streamlit) + actionable commands
-# ======================================================================
-st.markdown("---")
-st.markdown(
-    """
-    <div class="chat-card">
-        <div class="chat-title">💬 Portfolio Assistant</div>
-        <div class="chat-hint">
-            Try: “I want to be capped at 15% risk” → then “Explain allocations and correlation”.
-            Out-of-scope (e.g., weather) will be refused safely.
-        </div>
-    </div>
-    """,
-    unsafe_allow_html=True
-)
-
-# quick prompts
-q1, q2, q3, q4 = st.columns(4)
-if q1.button("Cap at 15% risk"):
-    st.session_state.prefill = "I want to be capped at 15% risk"
-if q2.button("Explain allocations"):
-    st.session_state.prefill = "Explain allocations"
-if q3.button("Explain correlation"):
-    st.session_state.prefill = "Explain correlation"
-if q4.button("Explain betas"):
-    st.session_state.prefill = "Explain betas"
-
-if "chat" not in st.session_state:
-    st.session_state.chat = []
-
-# render history
-for role, content in st.session_state.chat:
-    with st.chat_message(role):
-        st.markdown(content)
-
-# top-level chat input
-prefill = st.session_state.pop("prefill", "")
-user_msg = st.chat_input("Ask about your portfolio… (e.g., capped at 15% risk)")
-
-if user_msg:
-    st.session_state.chat.append(("user", user_msg))
-    with st.chat_message("user"):
-        st.markdown(user_msg)
-
-    ctx = st.session_state.get("app_context", {})
-
-    # Try OpenAI assistant first (if key available), then fall back to local safe_assistant
-    answer = None
-    action = None
-    if OPENAI_API_KEY:
-        try:
-            from app_ai_helpers import call_openai_assistant
-            resp_text, act = call_openai_assistant(user_msg, ctx, OPENAI_API_KEY)
-            if resp_text is None:
-                # resp_text None indicates failure; fall back to safe_assistant
-                pass
-            else:
-                answer = resp_text
-                action = act
-        except Exception:
-            # Silently fall back on error
-            pass
-
-    if answer is None:
-        answer = safe_assistant(user_msg, ctx)
-
-    st.session_state.chat.append(("assistant", answer))
-    with st.chat_message("assistant"):
-        st.markdown(answer)
-
-    # If assistant triggered an action, apply it and rerun
-    if action and isinstance(action, dict):
-        if action.get('action') == 'target_vol' and 'target_vol' in action:
-            try:
-                tv = float(action.get('target_vol'))
-                st.session_state.ai_target_vol = float(tv)
-                st.session_state.ai_action = 'target_vol'
-                st.rerun()
-            except Exception:
-                pass
-    else:
-        # Also check free-text parsing from safe_assistant
-        if parse_target_vol(answer) is not None:
-            st.session_state.ai_target_vol = float(parse_target_vol(answer))
-            st.session_state.ai_action = 'target_vol'
-            st.rerun()
-
-# Footer
-# Footer removed — reverting to original layout
