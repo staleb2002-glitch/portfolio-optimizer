@@ -426,7 +426,7 @@ st.write(
 
 with st.sidebar:
     st.markdown('<div class="sidebar-section"><div class="section-label">Assets</div></div>', unsafe_allow_html=True)
-    tickers_text = st.text_input("Tickers (comma-separated)", "VWCE.DE,IWDA.AS,EWD,VEUR.AS,SXR8.DE,IEMA.AS,IEGA.AS,XGLE.DE")
+    tickers_text = st.text_input("Tickers (comma-separated)", "AAPL,MSFT,GOOGL,AMZN,NVDA,META,TSLA")
     tickers = [t.strip().upper() for t in tickers_text.split(",") if t.strip()]
 
     st.markdown('<div class="sidebar-section"><div class="section-label">Period</div></div>', unsafe_allow_html=True)
@@ -465,10 +465,10 @@ with st.sidebar:
         tv_pct = st.slider("Target Volatility (annual %)", 1, 40, 15)
         target_vol_input = float(tv_pct) / 100.0
 
-    # Pre-set target weights for the European portfolio
+    # Pre-set target weights for the Magnificent 7
     _DEFAULT_WEIGHTS = {
-        "VWCE.DE": 20.0, "IWDA.AS": 15.0, "EWD": 15.0, "VEUR.AS": 15.0,
-        "SXR8.DE": 10.0, "IEMA.AS": 5.0, "IEGA.AS": 10.0, "XGLE.DE": 10.0,
+        "AAPL": 14.3, "MSFT": 14.3, "GOOGL": 14.3, "AMZN": 14.3,
+        "NVDA": 14.3, "META": 14.3, "TSLA": 14.2,
     }
 
     custom_weights_input = {}
