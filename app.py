@@ -965,6 +965,59 @@ with tab1:
     fig_w.update_layout(height=290, margin=dict(l=10, r=10, t=40, b=10), yaxis_title="Weight", title="Allocation")
     st.plotly_chart(fig_w, use_container_width=True)
 
+    # --- Normal Distribution of Portfolio Returns ---
+    st.subheader("Return Distribution (Normal Approximation)")
+    from scipy.stats import norm
+    _nd_x = np.linspace(port_r - 4 * port_v, port_r + 4 * port_v, 400)
+    _nd_y = norm.pdf(_nd_x, loc=port_r, scale=port_v) if port_v > 1e-12 else np.zeros_like(_nd_x)
+
+    fig_nd = go.Figure()
+
+    # Shaded areas for σ bands (±3σ, ±2σ, ±1σ — layered wide to narrow)
+    for n_sig, color, label in [
+        (3, "rgba(239,85,59,0.10)", "±3σ (99.7%)"),
+        (2, "rgba(255,161,90,0.18)", "±2σ (95.4%)"),
+        (1, "rgba(99,110,250,0.22)", "±1σ (68.3%)"),
+    ]:
+        lo, hi = port_r - n_sig * port_v, port_r + n_sig * port_v
+        mask = (_nd_x >= lo) & (_nd_x <= hi)
+        fig_nd.add_trace(go.Scatter(
+            x=_nd_x[mask], y=_nd_y[mask],
+            fill="tozeroy", mode="none",
+            fillcolor=color, name=label,
+            hoverinfo="skip",
+        ))
+
+    # PDF curve
+    fig_nd.add_trace(go.Scatter(
+        x=_nd_x, y=_nd_y, mode="lines",
+        line=dict(color="#636EFA", width=2.5), name="PDF",
+        hovertemplate="Return: %{x:.2%}<br>Density: %{y:.4f}<extra></extra>",
+    ))
+
+    # Mean line
+    fig_nd.add_vline(x=port_r, line_dash="dash", line_color="#636EFA",
+                     annotation_text=f"μ = {port_r:.2%}", annotation_position="top right")
+
+    # ±1σ, ±2σ lines
+    for n_sig, dash, col in [(1, "dot", "#00CC96"), (2, "dashdot", "#FFA15A")]:
+        fig_nd.add_vline(x=port_r - n_sig * port_v, line_dash=dash, line_color=col,
+                         annotation_text=f"-{n_sig}σ ({port_r - n_sig * port_v:.2%})",
+                         annotation_position="bottom left")
+        fig_nd.add_vline(x=port_r + n_sig * port_v, line_dash=dash, line_color=col,
+                         annotation_text=f"+{n_sig}σ ({port_r + n_sig * port_v:.2%})",
+                         annotation_position="bottom right")
+
+    fig_nd.update_layout(
+        height=360, margin=dict(l=10, r=10, t=40, b=10),
+        xaxis_title="Annualized Return",
+        yaxis_title="Probability Density",
+        xaxis_tickformat=".1%",
+        title=f"Normal Distribution — μ={port_r:.2%}, σ={port_v:.2%}",
+        showlegend=True, legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1),
+    )
+    st.plotly_chart(fig_nd, use_container_width=True)
+
     if investment_amount > 0:
         st.subheader("Capital Allocation")
         expected_return_dollars = float(investment_amount) * float(port_r)
