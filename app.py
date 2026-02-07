@@ -19,14 +19,14 @@ st.set_page_config(page_title="Portfolio Optimizer", layout="wide")
 CSS = """
 <style>
 .block-container { padding-top: 1.1rem; padding-bottom: 2rem; max-width: 1350px; }
-.small-muted { color: rgba(0,0,0,0.55); font-size: 0.9rem; }
+.small-muted { color: rgba(255,255,255,0.7); font-size: 0.9rem; }
 .kpi { font-size: 0.95rem; font-weight: 700; margin: 0; }
-.kpi-sub { color: rgba(0,0,0,0.55); font-size: 0.8rem; margin: 0; }
+.kpi-sub { color: rgba(255,255,255,0.85); font-size: 0.8rem; margin: 0; }
 .kpi-amount { font-size: 0.9rem; font-weight: 700; margin: 0; white-space: nowrap; }
-.kpi-amount-label { color: rgba(0,0,0,0.55); font-size: 0.75rem; margin: 0; }
+.kpi-amount-label { color: rgba(255,255,255,0.85); font-size: 0.75rem; margin: 0; }
 hr { border-color: rgba(0,0,0,0.1); }
 /* Fit metrics in 8 columns */
-[data-testid="stMetric"] label { font-size: 0.8rem !important; }
+[data-testid="stMetric"] label { font-size: 0.8rem !important; color: rgba(255,255,255,0.85) !important; }
 [data-testid="stMetric"] [data-testid="stMetricValue"] { font-size: 1.15rem !important; }
 </style>
 """
