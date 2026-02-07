@@ -135,12 +135,19 @@ def _build_styles() -> dict:
 def _chart_to_image(fig: plt.Figure, width_cm: float = 16, dpi: int = 180) -> Image:
     """Render a matplotlib figure into a reportlab Image flowable."""
     buf = io.BytesIO()
+    fig_w, fig_h = fig.get_size_inches()
     fig.savefig(buf, format="png", dpi=dpi, bbox_inches="tight", pad_inches=0.15)
     plt.close(fig)
     buf.seek(0)
-    aspect = fig.get_size_inches()[1] / fig.get_size_inches()[0]
+
+    # Read actual rendered image size so the PDF matches what was saved
+    from PIL import Image as PILImage
+    pil_img = PILImage.open(buf)
+    px_w, px_h = pil_img.size
+    buf.seek(0)
+
     img_w = width_cm * cm
-    img_h = img_w * aspect
+    img_h = img_w * (px_h / px_w)
     return Image(buf, width=img_w, height=img_h)
 
 
@@ -160,7 +167,7 @@ def generate_pie_chart(weights: Dict[str, float], title: str = "Asset Allocation
     labels, sizes = zip(*filtered)
     clrs = PIE_COLORS[: len(labels)]
 
-    fig, ax = plt.subplots(figsize=(6, 4.5))
+    fig, ax = plt.subplots(figsize=(8, 4.5))
     wedges, texts, autotexts = ax.pie(
         sizes,
         labels=None,
@@ -179,11 +186,54 @@ def generate_pie_chart(weights: Dict[str, float], title: str = "Asset Allocation
         wedges,
         labels,
         loc="center left",
-        bbox_to_anchor=(1.0, 0.5),
+        bbox_to_anchor=(1.05, 0.5),
         fontsize=9,
         frameon=False,
     )
     ax.set_title(title, fontsize=13, fontweight="bold", color="#1a1a2e", pad=14)
+    fig.subplots_adjust(right=0.65)
+    return fig
+
+
+def generate_frontier_chart(
+    pv_cloud,
+    pr_cloud,
+    port_v: float,
+    port_r: float,
+    cml_v=None,
+    cml_r=None,
+    selected_label: str = "Selected",
+) -> plt.Figure:
+    """Efficient frontier scatter chart for the report."""
+    fig, ax = plt.subplots(figsize=(7, 4.2))
+    pv = np.asarray(pv_cloud)
+    pr = np.asarray(pr_cloud)
+
+    ax.scatter(pv, pr, s=2, alpha=0.25, c="#a0b4d0", edgecolors="none",
+               label="Simulated portfolios", rasterized=True)
+
+    if cml_v and cml_r:
+        ax.plot(cml_v, cml_r, color="#fca311", linewidth=2, label="CML", zorder=5)
+
+    sharpe_c = np.where(pv > 1e-12, pr / pv, np.nan)
+    i_best = int(np.nanargmax(sharpe_c))
+    ax.scatter([pv[i_best]], [pr[i_best]], s=120, marker="*",
+               c="#fca311", edgecolors="#333", linewidths=0.5,
+               label="Max Sharpe", zorder=6)
+
+    ax.scatter([port_v], [port_r], s=80, marker="D", c="#e94560",
+               edgecolors="white", linewidths=1, label=selected_label, zorder=7)
+
+    ax.set_xlabel("Annualized Volatility", fontsize=9, color="#333")
+    ax.set_ylabel("Annualized Return", fontsize=9, color="#333")
+    import matplotlib.ticker as mtick
+    ax.xaxis.set_major_formatter(mtick.PercentFormatter(1.0, decimals=0))
+    ax.yaxis.set_major_formatter(mtick.PercentFormatter(1.0, decimals=0))
+    ax.tick_params(labelsize=8, colors="#666")
+    ax.legend(fontsize=7, frameon=True, edgecolor="#ccc", loc="upper left")
+    ax.grid(True, alpha=0.2, linestyle="--")
+    ax.spines["top"].set_visible(False)
+    ax.spines["right"].set_visible(False)
     fig.tight_layout()
     return fig
 
@@ -465,7 +515,23 @@ def generate_portfolio_report(report_data: dict, output_path: str) -> str:
             elements.append(_chart_to_image(fig_perf, width_cm=16))
             add_spacer(4)
 
-    # ── 7) Manager commentary ─────────────────────
+    # ── 7) Efficient frontier chart ─────────────
+    frontier = report_data.get("frontier")
+    if frontier:
+        add_section("Efficient Frontier")
+        fig_front = generate_frontier_chart(
+            pv_cloud=frontier["pv_cloud"],
+            pr_cloud=frontier["pr_cloud"],
+            port_v=frontier["port_v"],
+            port_r=frontier["port_r"],
+            cml_v=frontier.get("cml_v"),
+            cml_r=frontier.get("cml_r"),
+            selected_label=frontier.get("selected_label", "Selected"),
+        )
+        elements.append(_chart_to_image(fig_front, width_cm=16))
+        add_spacer(4)
+
+    # ── 8) Manager commentary ─────────────────────
     commentary = report_data.get("commentary")
     if commentary:
         add_section("Manager Commentary")

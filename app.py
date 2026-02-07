@@ -8,6 +8,7 @@ import streamlit as st
 import yfinance as yf
 import plotly.graph_objects as go
 from portfolio_report import generate_portfolio_report
+from portfolio_report_pptx import generate_pptx_report
 
 TRADING_DAYS = 252
 
@@ -18,11 +19,14 @@ CSS = """
 <style>
 .block-container { padding-top: 1.1rem; padding-bottom: 2rem; max-width: 1350px; }
 .small-muted { color: rgba(0,0,0,0.55); font-size: 0.9rem; }
-.kpi { font-size: 1.05rem; font-weight: 700; margin: 0; }
-.kpi-sub { color: rgba(0,0,0,0.55); font-size: 0.85rem; margin: 0; }
-.kpi-amount { font-size: 0.95rem; font-weight: 700; margin: 0; white-space: nowrap; }
-.kpi-amount-label { color: rgba(0,0,0,0.55); font-size: 0.8rem; margin: 0; }
+.kpi { font-size: 0.95rem; font-weight: 700; margin: 0; }
+.kpi-sub { color: rgba(0,0,0,0.55); font-size: 0.8rem; margin: 0; }
+.kpi-amount { font-size: 0.9rem; font-weight: 700; margin: 0; white-space: nowrap; }
+.kpi-amount-label { color: rgba(0,0,0,0.55); font-size: 0.75rem; margin: 0; }
 hr { border-color: rgba(0,0,0,0.1); }
+/* Fit metrics in 8 columns */
+[data-testid="stMetric"] label { font-size: 0.8rem !important; }
+[data-testid="stMetric"] [data-testid="stMetricValue"] { font-size: 1.15rem !important; }
 </style>
 """
 st.markdown(CSS, unsafe_allow_html=True)
@@ -50,7 +54,8 @@ def download_close_prices(tickers, start, end):
         prices = raw[["Close"]].rename(columns={"Close": tickers[0]})
 
     prices = prices.dropna(how="all")
-    prices = prices.dropna(axis=1, how="any")  # keep complete history only
+    prices = prices.ffill()          # fill exchange-holiday gaps with last close
+    prices = prices.dropna(axis=1, how="any")  # drop tickers still missing data
     return prices
 
 
@@ -419,11 +424,11 @@ st.write(
 
 with st.sidebar:
     st.markdown('<div class="sidebar-section"><div class="section-label">Assets</div></div>', unsafe_allow_html=True)
-    tickers_text = st.text_input("Tickers (comma-separated)", "AAPL,MSFT,GOOGL,AMZN")
+    tickers_text = st.text_input("Tickers (comma-separated)", "VWCE.DE,IWDA.AS,EWD,VEUR.AS,SXR8.DE,IEMA.AS,IEGA.AS,XGLE.DE")
     tickers = [t.strip().upper() for t in tickers_text.split(",") if t.strip()]
 
     st.markdown('<div class="sidebar-section"><div class="section-label">Period</div></div>', unsafe_allow_html=True)
-    start = st.date_input("Start", value=pd.to_datetime("2020-01-01"))
+    start = st.date_input("Start", value=pd.to_datetime("2019-08-01"))
     end = st.date_input("End", value=pd.to_datetime("today"))
 
     st.markdown('<div class="sidebar-section"><div class="section-label">Benchmark (Beta)</div></div>', unsafe_allow_html=True)
@@ -440,7 +445,7 @@ with st.sidebar:
     max_w = st.slider("Max weight per asset", 0.10, 1.00, 1.00, 0.05)
 
     st.markdown('<div class="sidebar-section"><div class="section-label">Capital Allocation</div></div>', unsafe_allow_html=True)
-    currency_choice = st.selectbox("Currency", ["USD", "EUR", "GBP", "CAD", "AUD", "JPY"], index=0)
+    currency_choice = st.selectbox("Currency", ["EUR", "USD", "GBP", "CAD", "AUD", "JPY"], index=0)
     investment_amount = st.number_input("Investment amount ($)", min_value=0.0, value=10000.0, step=100.0, format="%.2f")
 
     st.markdown('<div class="sidebar-section"><div class="section-label">Engine</div></div>', unsafe_allow_html=True)
@@ -450,13 +455,34 @@ with st.sidebar:
     st.markdown('<div class="sidebar-section"><div class="section-label">Optimization Method</div></div>', unsafe_allow_html=True)
     portfolio_strategy = st.selectbox(
         "Method",
-        ["Max Sharpe", "Minimum Variance", "Target Volatility"]
+        ["Custom Allocation", "Max Sharpe", "Minimum Variance", "Target Volatility"],
     )
     target_vol_input = None
     if portfolio_strategy == "Target Volatility":
         # slider inputs shown as percent in UI; keep decimal used elsewhere
         tv_pct = st.slider("Target Volatility (annual %)", 1, 40, 15)
         target_vol_input = float(tv_pct) / 100.0
+
+    # Pre-set target weights for the European portfolio
+    _DEFAULT_WEIGHTS = {
+        "VWCE.DE": 20.0, "IWDA.AS": 15.0, "EWD": 15.0, "VEUR.AS": 15.0,
+        "SXR8.DE": 10.0, "IEMA.AS": 5.0, "IEGA.AS": 10.0, "XGLE.DE": 10.0,
+    }
+
+    custom_weights_input = {}
+    if portfolio_strategy == "Custom Allocation":
+        st.markdown("**Set weight for each asset (%)**")
+        n_assets = len(tickers)
+        default_equal = round(100.0 / max(n_assets, 1), 1)
+        for tk in tickers:
+            custom_weights_input[tk] = st.number_input(
+                f"{tk} %", min_value=0.0, max_value=100.0,
+                value=_DEFAULT_WEIGHTS.get(tk, default_equal),
+                step=0.5, key=f"cw_{tk}"
+            )
+        total_pct = sum(custom_weights_input.values())
+        if abs(total_pct - 100.0) > 0.5:
+            st.warning(f"⚠️ Weights sum to {total_pct:.1f}% — they should add up to 100%.")
     
     # ---------------- Figma section ----------------
     # (no additional sidebar integrations)
@@ -593,6 +619,19 @@ try:
             selected_label = "Min Variance (risky-only)"
             weights_df = pd.DataFrame({"Asset": list(prices.columns), "Weight": list(w_min)})
 
+    elif active_strategy == "Custom Allocation" and custom_weights_input:
+        # User-defined weights
+        total_pct = sum(custom_weights_input.values())
+        w_custom = np.array([custom_weights_input.get(t, 0.0) for t in prices.columns])
+        if total_pct > 0:
+            w_custom = w_custom / w_custom.sum()   # normalise to 1
+        else:
+            w_custom = np.ones(len(prices.columns)) / len(prices.columns)
+        port_r, port_v = portfolio_metrics_risky(w_custom, mu, cov)
+        port_s = (port_r - rf) / port_v if port_v > 0 else np.nan
+        selected_label = "Custom Allocation"
+        weights_df = pd.DataFrame({"Asset": list(prices.columns), "Weight": list(w_custom)})
+
     else:  # Max Sharpe (default)
         if include_rf:
             alpha = 1.0
@@ -616,6 +655,18 @@ try:
     weights_df["Weight"] = weights_df["Weight"].astype(float)
     weights_df = weights_df.sort_values("Weight", ascending=False).reset_index(drop=True)
 
+    # Compute total (cumulative) period return from weighted daily returns
+    w_risky_only = weights_df[weights_df["Asset"] != "RISK-FREE"].copy()
+    port_daily_rets = pd.Series(0.0, index=rets.index)
+    for _, row in w_risky_only.iterrows():
+        asset = row["Asset"]
+        wgt = float(row["Weight"])
+        if asset in rets.columns:
+            port_daily_rets = port_daily_rets + rets[asset] * wgt
+    total_period_return = float((1 + port_daily_rets).prod() - 1)
+    n_years = len(rets) / TRADING_DAYS
+    total_return_cash = float(investment_amount) * total_period_return
+
     # Save context for chat responses
     st.session_state.app_context = {
         "selected_label": selected_label,
@@ -623,6 +674,9 @@ try:
         "port_r": port_r,
         "port_v": port_v,
         "port_s": port_s,
+        "total_period_return": total_period_return,
+        "total_return_cash": total_return_cash,
+        "n_years": n_years,
         "weights_df": weights_df,
         "investment_amount": float(investment_amount),
         "expected_return_dollars": float(investment_amount) * float(port_r),
@@ -644,9 +698,9 @@ except Exception as e:
 # =========================
 max_sharpe_cloud = float(np.nanmax(sharpe_cloud)) if len(sharpe_cloud) > 0 else np.nan
 st.markdown("### Key Metrics")
-k1, k2, k3, k4, k5, k6 = st.columns(6)
+k1, k2, k3, k4, k5, k6, k7, k8 = st.columns(8)
 with k1:
-    st.metric("Expected Return", f"{port_r:.2%}")
+    st.metric("Annual Return", f"{port_r:.2%}")
 with k2:
     st.metric("Volatility", f"{port_v:.2%}")
 with k3:
@@ -657,10 +711,18 @@ with k5:
     expected_return_value = float(investment_amount) * float(port_r)
     st.markdown(
         f"<div class=\"kpi-amount\">{expected_return_value:,.2f} {currency_choice}</div>"
-        f"<div class=\"kpi-amount-label\">Expected Return ({currency_choice})</div>",
+        f"<div class=\"kpi-amount-label\">Expected Annual ({currency_choice})</div>",
         unsafe_allow_html=True,
     )
 with k6:
+    st.metric(f"Total Return ({n_years:.1f}y)", f"{total_period_return:.2%}")
+with k7:
+    st.markdown(
+        f"<div class=\"kpi-amount\">{total_return_cash:+,.2f} {currency_choice}</div>"
+        f"<div class=\"kpi-amount-label\">Total P&L ({currency_choice})</div>",
+        unsafe_allow_html=True,
+    )
+with k8:
     st.info(f"📋 {selected_label}")
 
 st.markdown("---")
@@ -670,26 +732,7 @@ st.markdown("---")
 # =========================
 def _build_report_data() -> dict:
     """Assemble report_data dict from current optimizer state."""
-    # Performance: compute period returns from prices
-    perf = {}
-    total_days = len(prices)
-    if total_days > 21:
-        r1m = float((prices.iloc[-1] / prices.iloc[-22]).mean() - 1)
-        perf["1M"] = r1m
-    first_of_year = prices.loc[prices.index >= pd.Timestamp(prices.index[-1].year, 1, 1)]
-    if len(first_of_year) > 1:
-        perf["YTD"] = float((first_of_year.iloc[-1] / first_of_year.iloc[0]).mean() - 1)
-    if total_days > 252:
-        perf["1Y"] = float((prices.iloc[-1] / prices.iloc[-253]).mean() - 1)
-    perf["Since Inception"] = float((prices.iloc[-1] / prices.iloc[0]).mean() - 1)
-
-    # Holdings table
-    h_df = weights_df.copy()
-    h_df.columns = ["Ticker", "Weight"]
-    h_df["Market Value"] = h_df["Weight"] * float(investment_amount)
-    h_df["P/L"] = h_df["Market Value"] * float(port_r)
-
-    # Weighted portfolio cumulative returns
+    # Weighted portfolio daily returns
     w_risky_only = weights_df[weights_df["Asset"] != "RISK-FREE"].copy()
     port_daily = pd.Series(0.0, index=rets.index)
     for _, row in w_risky_only.iterrows():
@@ -697,7 +740,28 @@ def _build_report_data() -> dict:
         wgt = float(row["Weight"])
         if asset in rets.columns:
             port_daily = port_daily + rets[asset] * wgt
-    port_cum = (1 + port_daily).cumprod() * 100
+    port_cum = (1 + port_daily).cumprod()
+
+    # Performance: compute weighted period returns from cumulative series
+    perf = {}
+    total_days = len(port_cum)
+    if total_days > 21:
+        perf["1M"] = float(port_cum.iloc[-1] / port_cum.iloc[-22] - 1)
+    first_of_year = port_cum.loc[port_cum.index >= pd.Timestamp(port_cum.index[-1].year, 1, 1)]
+    if len(first_of_year) > 1:
+        perf["YTD"] = float(first_of_year.iloc[-1] / first_of_year.iloc[0] - 1)
+    if total_days > 252:
+        perf["1Y"] = float(port_cum.iloc[-1] / port_cum.iloc[-253] - 1)
+    perf["Since Inception"] = float(port_cum.iloc[-1] / port_cum.iloc[0] - 1)
+
+    # Scale cumulative to base 100 for chart
+    port_cum_chart = port_cum * 100
+
+    # Holdings table
+    h_df = weights_df.copy()
+    h_df.columns = ["Ticker", "Weight"]
+    h_df["Market Value"] = h_df["Weight"] * float(investment_amount)
+    h_df["P/L"] = h_df["Market Value"] * float(port_r)
 
     # Benchmark cumulative
     bench_cum = None
@@ -715,6 +779,44 @@ def _build_report_data() -> dict:
     drawdown = (port_cum - running_max) / running_max
     max_dd = float(drawdown.min()) if len(drawdown) > 0 else 0.0
 
+    # CML curve data for frontier chart
+    _cml_v, _cml_r = None, None
+    if include_rf:
+        _alphas = np.linspace(0.0, leverage_cap, 80)
+        _cml_v, _cml_r = [], []
+        for _a in _alphas:
+            _rr, _vv, _, _, _ = cml_metrics(float(_a), w_tan, mu, cov, rf)
+            _cml_r.append(float(_rr))
+            _cml_v.append(float(_vv))
+
+    # AI-generated comprehensive commentary
+    _ai_ctx = {
+        "selected_label": selected_label,
+        "port_r": float(port_r),
+        "port_v": float(port_v),
+        "port_s": float(port_s),
+        "rf": float(rf),
+        "total_period_return": float(total_period_return),
+        "n_years": float(n_years),
+        "investment_amount": float(investment_amount),
+        "currency_choice": currency_choice,
+        "benchmark": benchmark,
+        "weights_df": weights_df,
+        "betas": betas,
+        "corr_matrix": corr_matrix,
+        "risk": {"Max Drawdown": max_dd},
+    }
+    try:
+        from app_ai_helpers import generate_ai_commentary
+        _commentary = generate_ai_commentary(_ai_ctx, OPENAI_API_KEY)
+    except Exception:
+        _commentary = [
+            f"Strategy: {selected_label}. "
+            f"Expected annual return {port_r:.2%} with {port_v:.2%} volatility (Sharpe {port_s:.2f}).",
+            f"Assets analyzed over {start} – {end}. "
+            f"Risk-free rate assumed at {rf:.2%} annually. Benchmark: {benchmark}.",
+        ]
+
     return {
         "client_name": "Portfolio Optimizer Client",
         "report_date": pd.Timestamp.today().strftime("%Y-%m-%d"),
@@ -731,33 +833,53 @@ def _build_report_data() -> dict:
             for _, row in weights_df.iterrows()
         },
         "holdings_df": h_df,
-        "portfolio_series": port_cum,
+        "portfolio_series": port_cum_chart,
         "benchmark_series": bench_cum,
         "portfolio_label": selected_label,
         "benchmark_label": benchmark,
-        "commentary": [
-            f"Strategy: {selected_label}. "
-            f"Expected annual return {port_r:.2%} with {port_v:.2%} volatility (Sharpe {port_s:.2f}).",
-            f"Assets analyzed over {start} – {end}. "
-            f"Risk-free rate assumed at {rf:.2%} annually. "
-            f"Benchmark: {benchmark}.",
-        ],
+        "frontier": {
+            "pv_cloud": pv_cloud.tolist() if hasattr(pv_cloud, 'tolist') else list(pv_cloud),
+            "pr_cloud": pr_cloud.tolist() if hasattr(pr_cloud, 'tolist') else list(pr_cloud),
+            "port_v": float(port_v),
+            "port_r": float(port_r),
+            "cml_v": _cml_v,
+            "cml_r": _cml_r,
+            "selected_label": selected_label,
+        },
+        "commentary": _commentary,
     }
 
-if st.button("📄 Download PDF Report"):
-    with st.spinner("Generating report…"):
-        rd = _build_report_data()
-        tmp = tempfile.NamedTemporaryFile(suffix=".pdf", delete=False)
-        generate_portfolio_report(rd, tmp.name)
-        with open(tmp.name, "rb") as f:
-            pdf_bytes = f.read()
-        os.unlink(tmp.name)
-    st.download_button(
-        label="⬇️ Save Report PDF",
-        data=pdf_bytes,
-        file_name=f"portfolio_report_{pd.Timestamp.today().strftime('%Y%m%d')}.pdf",
-        mime="application/pdf",
-    )
+dl1, dl2 = st.columns(2)
+with dl1:
+    if st.button("📄 Generate PDF Report"):
+        with st.spinner("Generating PDF…"):
+            rd = _build_report_data()
+            tmp = tempfile.NamedTemporaryFile(suffix=".pdf", delete=False)
+            generate_portfolio_report(rd, tmp.name)
+            with open(tmp.name, "rb") as f:
+                pdf_bytes = f.read()
+            os.unlink(tmp.name)
+        st.download_button(
+            label="⬇️ Save PDF",
+            data=pdf_bytes,
+            file_name=f"portfolio_report_{pd.Timestamp.today().strftime('%Y%m%d')}.pdf",
+            mime="application/pdf",
+        )
+with dl2:
+    if st.button("📊 Generate PowerPoint Report"):
+        with st.spinner("Generating PPTX…"):
+            rd = _build_report_data()
+            tmp = tempfile.NamedTemporaryFile(suffix=".pptx", delete=False)
+            generate_pptx_report(rd, tmp.name)
+            with open(tmp.name, "rb") as f:
+                pptx_bytes = f.read()
+            os.unlink(tmp.name)
+        st.download_button(
+            label="⬇️ Save PowerPoint",
+            data=pptx_bytes,
+            file_name=f"portfolio_report_{pd.Timestamp.today().strftime('%Y%m%d')}.pptx",
+            mime="application/vnd.openxmlformats-officedocument.presentationml.presentation",
+        )
 
 # =========================
 # Two-tab layout
