@@ -513,6 +513,28 @@ def generate_portfolio_report(report_data: dict, output_path: str) -> str:
         )
         add_spacer(4)
 
+    # ── 3b) Expected Future Value ───────────────
+    horizon = report_data.get("investment_horizon")
+    fv = report_data.get("expected_future_value")
+    if horizon is not None and fv is not None:
+        currency = report_data.get("currency", "USD")
+        pnl_h = report_data.get("expected_pnl_horizon", 0)
+        fv_up = report_data.get("fv_upper")
+        fv_lo = report_data.get("fv_lower")
+        add_section(f"Expected Future Value ({horizon}Y Horizon)")
+        fv_rows = [["Metric", "Value"]]
+        fv_rows.append(["Investment", f"{report_data.get('portfolio_value', 0):,.2f} {currency}"])
+        fv_rows.append([f"Expected Value ({horizon}Y)", f"{fv:,.2f} {currency}"])
+        fv_rows.append([f"Expected P&L ({horizon}Y)", f"{pnl_h:+,.2f} {currency}"])
+        if fv_up is not None:
+            fv_rows.append(["Optimistic (+1\u03c3)", f"{fv_up:,.2f} {currency}"])
+        if fv_lo is not None:
+            fv_rows.append(["Pessimistic (\u22121\u03c3)", f"{fv_lo:,.2f} {currency}"])
+        elements.append(
+            _format_table(fv_rows, col_widths=[8 * cm, 6 * cm], right_align_cols=[1])
+        )
+        add_spacer(4)
+
     # ── 4) Asset allocation pie chart ─────────────
     weights = report_data.get("weights")
     if weights:

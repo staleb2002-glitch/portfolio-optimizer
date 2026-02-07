@@ -297,6 +297,7 @@ with st.sidebar:
     st.markdown('<div class="sidebar-section"><div class="section-label">Capital Allocation</div></div>', unsafe_allow_html=True)
     currency_choice = st.selectbox("Currency", ["EUR", "USD", "GBP", "CAD", "AUD", "JPY"], index=0)
     investment_amount = st.number_input("Investment amount ($)", min_value=0.0, value=10000.0, step=100.0, format="%.2f")
+    investment_horizon = st.slider("Investment horizon (years)", 1, 30, 5, 1)
 
     st.markdown('<div class="sidebar-section"><div class="section-label">Engine</div></div>', unsafe_allow_html=True)
     use_cvxpy = st.checkbox("Use true optimizer (cvxpy when available)", value=True)
@@ -655,6 +656,43 @@ with k13:
 with k14:
     st.metric(f"Beta vs {benchmark}", f"{port_beta:.2f}" if np.isfinite(port_beta) else "N/A")
 
+# Third row of KPIs – Expected Future Value
+expected_future_value = float(investment_amount) * (1 + float(port_r)) ** investment_horizon
+expected_pnl_horizon = expected_future_value - float(investment_amount)
+expected_cagr = float(port_r)  # already annualized
+# Confidence intervals using volatility (±1σ)
+fv_upper = float(investment_amount) * (1 + float(port_r) + float(port_v)) ** investment_horizon
+fv_lower = float(investment_amount) * max(0, (1 + float(port_r) - float(port_v))) ** investment_horizon
+
+st.markdown(f"### Expected Future Value ({investment_horizon}Y Horizon)")
+f1, f2, f3, f4, f5 = st.columns(5)
+with f1:
+    st.markdown(
+        f"<div class=\"kpi-amount\">{expected_future_value:,.2f} {currency_choice}</div>"
+        f"<div class=\"kpi-amount-label\">Expected Value ({investment_horizon}Y)</div>",
+        unsafe_allow_html=True,
+    )
+with f2:
+    st.markdown(
+        f"<div class=\"kpi-amount\">{expected_pnl_horizon:+,.2f} {currency_choice}</div>"
+        f"<div class=\"kpi-amount-label\">Expected P&L ({investment_horizon}Y)</div>",
+        unsafe_allow_html=True,
+    )
+with f3:
+    st.metric(f"CAGR ({investment_horizon}Y)", f"{expected_cagr:.2%}")
+with f4:
+    st.markdown(
+        f"<div class=\"kpi-amount\">{fv_upper:,.2f} {currency_choice}</div>"
+        f"<div class=\"kpi-amount-label\">Optimistic (+1σ)</div>",
+        unsafe_allow_html=True,
+    )
+with f5:
+    st.markdown(
+        f"<div class=\"kpi-amount\">{fv_lower:,.2f} {currency_choice}</div>"
+        f"<div class=\"kpi-amount-label\">Pessimistic (−1σ)</div>",
+        unsafe_allow_html=True,
+    )
+
 st.markdown("---")
 
 # =========================
@@ -786,6 +824,11 @@ def _build_report_data() -> dict:
         "cov_matrix": cov_matrix,
         "betas": betas,
         "capm_df": capm_df if capm_df is not None and not capm_df.empty else None,
+        "investment_horizon": investment_horizon,
+        "expected_future_value": expected_future_value,
+        "expected_pnl_horizon": expected_pnl_horizon,
+        "fv_upper": fv_upper,
+        "fv_lower": fv_lower,
         "commentary": _commentary,
     }
 

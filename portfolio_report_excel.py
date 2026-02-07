@@ -235,6 +235,34 @@ def _build_summary_sheet(wb, data):
         _apply_body_rows(ws, sb, row - 1, 1, 2)
         row += 1
 
+    # Expected Future Value
+    horizon = data.get("investment_horizon")
+    fv = data.get("expected_future_value")
+    if horizon is not None and fv is not None:
+        row = _write_section(ws, row, 1, f"Expected Future Value ({horizon}Y Horizon)")
+        fv_metrics = [
+            ("Investment", f"{data.get('portfolio_value', 0):,.2f} {currency}"),
+            (f"Expected Value ({horizon}Y)", f"{fv:,.2f} {currency}"),
+            (f"Expected P&L ({horizon}Y)", f"{data.get('expected_pnl_horizon', 0):+,.2f} {currency}"),
+        ]
+        fv_up = data.get("fv_upper")
+        fv_lo = data.get("fv_lower")
+        if fv_up is not None:
+            fv_metrics.append(("Optimistic (+1\u03c3)", f"{fv_up:,.2f} {currency}"))
+        if fv_lo is not None:
+            fv_metrics.append(("Pessimistic (\u22121\u03c3)", f"{fv_lo:,.2f} {currency}"))
+        for c, h in enumerate(["Metric", "Value"], 1):
+            ws.cell(row=row, column=c, value=h)
+        _apply_header_row(ws, row, 1, 2)
+        row += 1
+        sb = row
+        for label, val in fv_metrics:
+            ws.cell(row=row, column=1, value=label)
+            ws.cell(row=row, column=2, value=val)
+            row += 1
+        _apply_body_rows(ws, sb, row - 1, 1, 2)
+        row += 1
+
     # Commentary
     commentary = data.get("commentary", [])
     if commentary:

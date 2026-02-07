@@ -414,6 +414,17 @@ def _slide_kpis(prs: Presentation, report_data: dict):
             kpis.append((f"Exp. Return ({currency})", f"{value * ann:+,.0f} {currency}",
                          C_GREEN if ann >= 0 else C_ACCENT))
 
+    # Expected Future Value cards
+    horizon = report_data.get("investment_horizon")
+    fv = report_data.get("expected_future_value")
+    if horizon is not None and fv is not None:
+        currency = report_data.get("currency", "USD")
+        pnl_h = report_data.get("expected_pnl_horizon", 0)
+        kpis.append((f"Expected Value ({horizon}Y)", f"{fv:,.0f} {currency}",
+                     C_GREEN if pnl_h >= 0 else C_ACCENT))
+        kpis.append((f"Expected P&L ({horizon}Y)", f"{pnl_h:+,.0f} {currency}",
+                     C_GREEN if pnl_h >= 0 else C_ACCENT))
+
     # Lay out KPI cards in a 2-row grid
     cols = 4
     card_w = Inches(2.1)
