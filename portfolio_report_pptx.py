@@ -267,6 +267,62 @@ def _make_frontier_chart(
     return _fig_to_image_stream(fig)
 
 
+def _make_cumulative_returns_chart(
+    cum_returns: pd.DataFrame,
+) -> Optional[io.BytesIO]:
+    """Create a cumulative returns line chart for all individual assets."""
+    if cum_returns is None or cum_returns.empty:
+        return None
+
+    fig, ax = plt.subplots(figsize=(10, 5))
+    for i, col in enumerate(cum_returns.columns):
+        ax.plot(cum_returns.index, cum_returns[col],
+                linewidth=1.5, label=col,
+                color=PIE_COLORS_HEX[i % len(PIE_COLORS_HEX)])
+    ax.set_ylabel("Growth of 100", fontsize=11, color="#333333")
+    ax.set_title("Cumulative Returns (Base = 100)", fontsize=13,
+                 fontweight="bold", color="#1a1a2e", pad=10)
+    ax.legend(fontsize=8, frameon=True, edgecolor="#ccc", loc="upper left",
+              ncol=max(1, len(cum_returns.columns) // 6))
+    ax.tick_params(labelsize=9, colors="#666666")
+    ax.grid(True, alpha=0.25, linestyle="--")
+    ax.spines["top"].set_visible(False)
+    ax.spines["right"].set_visible(False)
+    ax.spines["left"].set_color("#cccccc")
+    ax.spines["bottom"].set_color("#cccccc")
+    fig.autofmt_xdate(rotation=30, ha="right")
+    fig.tight_layout()
+    return _fig_to_image_stream(fig)
+
+
+def _make_correlation_heatmap(
+    corr_matrix: pd.DataFrame,
+) -> Optional[io.BytesIO]:
+    """Create a correlation matrix heatmap."""
+    if corr_matrix is None or corr_matrix.empty:
+        return None
+
+    fig, ax = plt.subplots(figsize=(8, 6))
+    n = len(corr_matrix)
+    im = ax.imshow(corr_matrix.values, cmap="RdBu_r", vmin=-1, vmax=1, aspect="auto")
+    ax.set_xticks(range(n))
+    ax.set_yticks(range(n))
+    ax.set_xticklabels(corr_matrix.columns, fontsize=8, rotation=45, ha="right")
+    ax.set_yticklabels(corr_matrix.index, fontsize=8)
+    # Annotate cells
+    for i in range(n):
+        for j in range(n):
+            val = corr_matrix.iloc[i, j]
+            color = "white" if abs(val) > 0.6 else "black"
+            ax.text(j, i, f"{val:.2f}", ha="center", va="center",
+                    fontsize=8, color=color)
+    fig.colorbar(im, ax=ax, shrink=0.8)
+    ax.set_title("Correlation Matrix", fontsize=13, fontweight="bold",
+                 color="#1a1a2e", pad=10)
+    fig.tight_layout()
+    return _fig_to_image_stream(fig)
+
+
 # ──────────────────────────────────────────────
 # Slide builders
 # ──────────────────────────────────────────────
@@ -531,7 +587,259 @@ def _slide_frontier(prs: Presentation, report_data: dict):
                              width=Inches(9.3), height=Inches(5.5))
 
 
-def _slide_commentary(prs: Presentation, report_data: dict):
+def _slide_cumulative_returns(prs: Presentation, report_data: dict):
+    """Slide: Cumulative returns for all individual assets."""
+    cum_returns = report_data.get("cum_returns")
+    if cum_returns is None or (hasattr(cum_returns, "empty") and cum_returns.empty):
+        return
+
+    slide = prs.slides.add_slide(prs.slide_layouts[6])
+    sw = prs.slide_width
+
+    _add_shape_bg(slide, Emu(0), Emu(0), sw, Inches(0.9), C_DARK)
+    _add_textbox(slide, Inches(0.5), Inches(0.2), Inches(8), Inches(0.5),
+                 "CUMULATIVE RETURNS", font_size=22, bold=True, color=C_WHITE)
+
+    img_stream = _make_cumulative_returns_chart(cum_returns)
+    if img_stream:
+        slide.shapes.add_picture(img_stream, Inches(0.3), Inches(1.1),
+                                 width=Inches(9.3), height=Inches(5.5))
+
+
+def _slide_correlation(prs: Presentation, report_data: dict):
+    """Slide: Correlation matrix heatmap."""
+    corr_matrix = report_data.get("corr_matrix")
+    if corr_matrix is None or (hasattr(corr_matrix, "empty") and corr_matrix.empty):
+        return
+
+    slide = prs.slides.add_slide(prs.slide_layouts[6])
+    sw = prs.slide_width
+
+    _add_shape_bg(slide, Emu(0), Emu(0), sw, Inches(0.9), C_DARK)
+    _add_textbox(slide, Inches(0.5), Inches(0.2), Inches(8), Inches(0.5),
+                 "CORRELATION MATRIX", font_size=22, bold=True, color=C_WHITE)
+
+    img_stream = _make_correlation_heatmap(corr_matrix)
+    if img_stream:
+        slide.shapes.add_picture(img_stream, Inches(0.3), Inches(1.1),
+                                 width=Inches(9.3), height=Inches(5.5))
+
+
+def _slide_betas_capm(prs: Presentation, report_data: dict):
+    """Slide: Betas table and CAPM regression results."""
+    betas = report_data.get("betas")
+    capm_df = report_data.get("capm_df")
+    bench_label = report_data.get("benchmark_label", "Benchmark")
+
+    if betas is None and (capm_df is None or (hasattr(capm_df, "empty") and capm_df.empty)):
+        return
+
+    slide = prs.slides.add_slide(prs.slide_layouts[6])
+    sw = prs.slide_width
+
+    _add_shape_bg(slide, Emu(0), Emu(0), sw, Inches(0.9), C_DARK)
+    _add_textbox(slide, Inches(0.5), Inches(0.2), Inches(8), Inches(0.5),
+                 f"BETAS & CAPM vs {bench_label}", font_size=22, bold=True, color=C_WHITE)
+
+    y_pos = Inches(1.2)
+
+    # Betas table
+    if betas is not None and len(betas) > 0:
+        sorted_betas = betas.sort_values(ascending=False)
+        n_rows = min(len(sorted_betas) + 1, 15)
+        n_cols = 2
+
+        table_shape = slide.shapes.add_table(
+            n_rows, n_cols,
+            Inches(0.5), y_pos,
+            Inches(4.0), Inches(0.35) * n_rows,
+        )
+        table = table_shape.table
+
+        _set_cell_text(table.cell(0, 0), "Asset", font_size=10, bold=True, color=C_WHITE, alignment=PP_ALIGN.CENTER)
+        _set_cell_text(table.cell(0, 1), f"Beta vs {bench_label}", font_size=10, bold=True, color=C_WHITE, alignment=PP_ALIGN.CENTER)
+        table.cell(0, 0).fill.solid()
+        table.cell(0, 0).fill.fore_color.rgb = C_NAVY
+        table.cell(0, 1).fill.solid()
+        table.cell(0, 1).fill.fore_color.rgb = C_NAVY
+
+        for i, (asset, beta_val) in enumerate(sorted_betas.head(n_rows - 1).items()):
+            _set_cell_text(table.cell(i + 1, 0), str(asset), font_size=9, alignment=PP_ALIGN.CENTER)
+            _set_cell_text(table.cell(i + 1, 1), f"{beta_val:.2f}", font_size=9, alignment=PP_ALIGN.CENTER)
+            if i % 2 == 0:
+                table.cell(i + 1, 0).fill.solid()
+                table.cell(i + 1, 0).fill.fore_color.rgb = C_LIGHT_BG
+                table.cell(i + 1, 1).fill.solid()
+                table.cell(i + 1, 1).fill.fore_color.rgb = C_LIGHT_BG
+
+    # CAPM table on right side
+    if capm_df is not None and isinstance(capm_df, pd.DataFrame) and not capm_df.empty:
+        capm_display = capm_df.copy()
+        if "Alpha (daily)" in capm_display.columns:
+            capm_display["Alpha (ann.)"] = (1.0 + capm_display["Alpha (daily)"]) ** 252 - 1.0
+            display_cols = ["Asset", "Alpha (ann.)", "Beta", "R^2"]
+            display_cols = [c for c in display_cols if c in capm_display.columns]
+        else:
+            display_cols = list(capm_display.columns)[:5]
+
+        n_rows_capm = min(len(capm_display) + 1, 15)
+        n_cols_capm = len(display_cols)
+
+        table_shape2 = slide.shapes.add_table(
+            n_rows_capm, n_cols_capm,
+            Inches(5.0), y_pos,
+            Inches(4.8), Inches(0.35) * n_rows_capm,
+        )
+        table2 = table_shape2.table
+
+        for j, col_name in enumerate(display_cols):
+            _set_cell_text(table2.cell(0, j), col_name, font_size=9, bold=True, color=C_WHITE, alignment=PP_ALIGN.CENTER)
+            table2.cell(0, j).fill.solid()
+            table2.cell(0, j).fill.fore_color.rgb = C_NAVY
+
+        for i, (_, crow) in enumerate(capm_display.head(n_rows_capm - 1).iterrows()):
+            for j, col_name in enumerate(display_cols):
+                val = crow[col_name]
+                if col_name == "Asset":
+                    text = str(val)
+                elif "alpha" in col_name.lower():
+                    text = f"{val:.2%}"
+                else:
+                    text = f"{val:.2f}" if isinstance(val, (int, float)) else str(val)
+                _set_cell_text(table2.cell(i + 1, j), text, font_size=9, alignment=PP_ALIGN.CENTER)
+                if i % 2 == 0:
+                    table2.cell(i + 1, j).fill.solid()
+                    table2.cell(i + 1, j).fill.fore_color.rgb = C_LIGHT_BG
+
+
+def _slide_risk_analysis(prs: Presentation, report_data: dict):
+    """Slide: Risk analysis table + daily returns statistics."""
+    risk = report_data.get("risk", {})
+    portfolio_series = report_data.get("portfolio_series")
+
+    if not risk and (portfolio_series is None or len(portfolio_series) < 2):
+        return
+
+    slide = prs.slides.add_slide(prs.slide_layouts[6])
+    sw = prs.slide_width
+
+    _add_shape_bg(slide, Emu(0), Emu(0), sw, Inches(0.9), C_DARK)
+    _add_textbox(slide, Inches(0.5), Inches(0.2), Inches(8), Inches(0.5),
+                 "RISK ANALYSIS", font_size=22, bold=True, color=C_WHITE)
+
+    y_pos = Inches(1.2)
+
+    # Risk metrics table (left)
+    if risk:
+        filtered = {k: v for k, v in risk.items() if v is not None and isinstance(v, (int, float))}
+        n_rows = len(filtered) + 1
+        table_shape = slide.shapes.add_table(
+            n_rows, 2,
+            Inches(0.5), y_pos,
+            Inches(4.2), Inches(0.35) * n_rows,
+        )
+        table = table_shape.table
+        _set_cell_text(table.cell(0, 0), "Risk Metric", font_size=10, bold=True, color=C_WHITE, alignment=PP_ALIGN.CENTER)
+        _set_cell_text(table.cell(0, 1), "Value", font_size=10, bold=True, color=C_WHITE, alignment=PP_ALIGN.CENTER)
+        table.cell(0, 0).fill.solid()
+        table.cell(0, 0).fill.fore_color.rgb = C_NAVY
+        table.cell(0, 1).fill.solid()
+        table.cell(0, 1).fill.fore_color.rgb = C_NAVY
+
+        for i, (metric, val) in enumerate(filtered.items()):
+            _set_cell_text(table.cell(i + 1, 0), metric, font_size=9, alignment=PP_ALIGN.LEFT)
+            if "sharpe" in metric.lower() or "ratio" in metric.lower() or "beta" in metric.lower() or "r-squared" in metric.lower():
+                text = f"{val:.2f}"
+            else:
+                text = f"{val:.2%}"
+            _set_cell_text(table.cell(i + 1, 1), text, font_size=9, alignment=PP_ALIGN.CENTER)
+            if i % 2 == 0:
+                table.cell(i + 1, 0).fill.solid()
+                table.cell(i + 1, 0).fill.fore_color.rgb = C_LIGHT_BG
+                table.cell(i + 1, 1).fill.solid()
+                table.cell(i + 1, 1).fill.fore_color.rgb = C_LIGHT_BG
+
+    # Daily returns statistics table (right)
+    if portfolio_series is not None and len(portfolio_series) > 1:
+        daily_rets = portfolio_series.pct_change().dropna()
+        if len(daily_rets) > 0:
+            stats = [
+                ("Mean Daily Return", f"{daily_rets.mean():.4%}"),
+                ("Std Dev (Daily)", f"{daily_rets.std():.4%}"),
+                ("Skewness", f"{daily_rets.skew():.2f}"),
+                ("Kurtosis", f"{daily_rets.kurtosis():.2f}"),
+                ("Min Daily Return", f"{daily_rets.min():.4%}"),
+                ("Max Daily Return", f"{daily_rets.max():.4%}"),
+                ("Trading Days", f"{len(daily_rets):,}"),
+            ]
+            n_rows_stats = len(stats) + 1
+            table_shape2 = slide.shapes.add_table(
+                n_rows_stats, 2,
+                Inches(5.2), y_pos,
+                Inches(4.2), Inches(0.35) * n_rows_stats,
+            )
+            table2 = table_shape2.table
+            _set_cell_text(table2.cell(0, 0), "Statistic", font_size=10, bold=True, color=C_WHITE, alignment=PP_ALIGN.CENTER)
+            _set_cell_text(table2.cell(0, 1), "Value", font_size=10, bold=True, color=C_WHITE, alignment=PP_ALIGN.CENTER)
+            table2.cell(0, 0).fill.solid()
+            table2.cell(0, 0).fill.fore_color.rgb = C_NAVY
+            table2.cell(0, 1).fill.solid()
+            table2.cell(0, 1).fill.fore_color.rgb = C_NAVY
+
+            for i, (label, val_str) in enumerate(stats):
+                _set_cell_text(table2.cell(i + 1, 0), label, font_size=9, alignment=PP_ALIGN.LEFT)
+                _set_cell_text(table2.cell(i + 1, 1), val_str, font_size=9, alignment=PP_ALIGN.CENTER)
+                if i % 2 == 0:
+                    table2.cell(i + 1, 0).fill.solid()
+                    table2.cell(i + 1, 0).fill.fore_color.rgb = C_LIGHT_BG
+                    table2.cell(i + 1, 1).fill.solid()
+                    table2.cell(i + 1, 1).fill.fore_color.rgb = C_LIGHT_BG
+
+
+def _slide_calendar_returns(prs: Presentation, report_data: dict):
+    """Slide: Calendar year returns table."""
+    cal_year_returns = report_data.get("calendar_year_returns", {})
+    if not cal_year_returns:
+        return
+
+    slide = prs.slides.add_slide(prs.slide_layouts[6])
+    sw = prs.slide_width
+
+    _add_shape_bg(slide, Emu(0), Emu(0), sw, Inches(0.9), C_DARK)
+    _add_textbox(slide, Inches(0.5), Inches(0.2), Inches(8), Inches(0.5),
+                 "CALENDAR YEAR RETURNS", font_size=22, bold=True, color=C_WHITE)
+
+    years = list(cal_year_returns.keys())
+    returns = list(cal_year_returns.values())
+    n_rows = len(years) + 1
+
+    table_shape = slide.shapes.add_table(
+        n_rows, 2,
+        Inches(2.5), Inches(1.3),
+        Inches(5.0), Inches(0.38) * n_rows,
+    )
+    table = table_shape.table
+
+    _set_cell_text(table.cell(0, 0), "Year", font_size=11, bold=True, color=C_WHITE, alignment=PP_ALIGN.CENTER)
+    _set_cell_text(table.cell(0, 1), "Return", font_size=11, bold=True, color=C_WHITE, alignment=PP_ALIGN.CENTER)
+    table.cell(0, 0).fill.solid()
+    table.cell(0, 0).fill.fore_color.rgb = C_NAVY
+    table.cell(0, 1).fill.solid()
+    table.cell(0, 1).fill.fore_color.rgb = C_NAVY
+
+    for i, (yr, ret) in enumerate(zip(years, returns)):
+        _set_cell_text(table.cell(i + 1, 0), str(yr), font_size=10, alignment=PP_ALIGN.CENTER)
+        if isinstance(ret, (int, float)):
+            color = C_GREEN if ret >= 0 else C_ACCENT
+            _set_cell_text(table.cell(i + 1, 1), f"{ret:.2%}", font_size=10,
+                           color=color, alignment=PP_ALIGN.CENTER)
+        else:
+            _set_cell_text(table.cell(i + 1, 1), str(ret), font_size=10, alignment=PP_ALIGN.CENTER)
+        if i % 2 == 0:
+            table.cell(i + 1, 0).fill.solid()
+            table.cell(i + 1, 0).fill.fore_color.rgb = C_LIGHT_BG
+            table.cell(i + 1, 1).fill.solid()
+            table.cell(i + 1, 1).fill.fore_color.rgb = C_LIGHT_BG
     """Slide: Manager / AI commentary."""
     commentary = report_data.get("commentary")
     if not commentary:
@@ -593,6 +901,11 @@ def generate_pptx_report(report_data: dict, output_path: str) -> str:
     _slide_holdings(prs, report_data)
     _slide_performance(prs, report_data)
     _slide_frontier(prs, report_data)
+    _slide_cumulative_returns(prs, report_data)
+    _slide_correlation(prs, report_data)
+    _slide_betas_capm(prs, report_data)
+    _slide_risk_analysis(prs, report_data)
+    _slide_calendar_returns(prs, report_data)
     _slide_commentary(prs, report_data)
 
     prs.save(output_path)

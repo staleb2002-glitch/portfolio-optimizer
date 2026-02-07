@@ -195,6 +195,30 @@ def generate_pie_chart(weights: Dict[str, float], title: str = "Asset Allocation
     return fig
 
 
+def generate_cumulative_returns_chart(
+    cum_returns: pd.DataFrame,
+    title: str = "Cumulative Returns (Base = 100)",
+) -> Optional[plt.Figure]:
+    """Line chart of all individual asset cumulative returns."""
+    if cum_returns is None or cum_returns.empty:
+        return None
+    fig, ax = plt.subplots(figsize=(8, 4.2))
+    for i, col in enumerate(cum_returns.columns):
+        ax.plot(cum_returns.index, cum_returns[col],
+                linewidth=1.4, label=col,
+                color=PIE_COLORS[i % len(PIE_COLORS)])
+    ax.set_ylabel("Growth of 100", fontsize=9)
+    ax.set_title(title, fontsize=13, fontweight="bold", color="#1a1a2e", pad=10)
+    ax.legend(fontsize=7, frameon=True, edgecolor="#ccc", loc="upper left",
+              ncol=max(1, len(cum_returns.columns) // 6))
+    ax.grid(axis="y", alpha=0.3)
+    ax.spines["top"].set_visible(False)
+    ax.spines["right"].set_visible(False)
+    fig.autofmt_xdate(rotation=30, ha="right")
+    fig.tight_layout()
+    return fig
+
+
 def generate_frontier_chart(
     pv_cloud,
     pr_cloud,
@@ -473,9 +497,13 @@ def generate_portfolio_report(report_data: dict, output_path: str) -> str:
         add_section("Risk Metrics")
         risk_rows = [["Metric", "Value"]]
         for metric, val in risk.items():
+            if val is None:
+                continue
             if isinstance(val, (int, float)):
-                if "sharpe" in metric.lower():
+                if any(k in metric.lower() for k in ("sharpe", "sortino", "ratio", "beta", "r-squared")):
                     risk_rows.append([str(metric), f"{val:.2f}"])
+                elif "alpha" in metric.lower():
+                    risk_rows.append([str(metric), f"{val:.2%}"])
                 else:
                     risk_rows.append([str(metric), f"{val:.2%}"])
             else:
@@ -531,7 +559,136 @@ def generate_portfolio_report(report_data: dict, output_path: str) -> str:
         elements.append(_chart_to_image(fig_front, width_cm=16))
         add_spacer(4)
 
-    # ── 8) Manager commentary ─────────────────────
+    # ── 8) Cumulative Returns (all assets) ────────
+    cum_returns = report_data.get("cum_returns")
+    if cum_returns is not None and isinstance(cum_returns, pd.DataFrame) and not cum_returns.empty:
+        add_section("Cumulative Returns (All Assets)")
+        fig_cum = generate_cumulative_returns_chart(cum_returns)
+        if fig_cum is not None:
+            elements.append(_chart_to_image(fig_cum, width_cm=16))
+            add_spacer(4)
+
+    # ── 9) Correlation Matrix ─────────────────────
+    corr_matrix = report_data.get("corr_matrix")
+    if corr_matrix is not None and isinstance(corr_matrix, pd.DataFrame) and not corr_matrix.empty:
+        add_section("Correlation Matrix")
+        labels = list(corr_matrix.columns)
+        corr_header = [""] + [str(l) for l in labels]
+        corr_rows = [corr_header]
+        for i, lab in enumerate(labels):
+            row_data = [str(lab)]
+            for j in range(len(labels)):
+                row_data.append(f"{corr_matrix.iloc[i, j]:.2f}")
+            corr_rows.append(row_data)
+        n_c = len(corr_header)
+        cw = max(2 * cm, 16 * cm / n_c)
+        elements.append(
+            _format_table(corr_rows, col_widths=[cw] * n_c,
+                          right_align_cols=list(range(1, n_c)))
+        )
+        add_spacer(4)
+
+    # ── 10) Covariance Matrix ─────────────────────
+    cov_matrix = report_data.get("cov_matrix")
+    if cov_matrix is not None and isinstance(cov_matrix, pd.DataFrame) and not cov_matrix.empty:
+        add_section("Covariance Matrix (Annualized)")
+        labels = list(cov_matrix.columns)
+        cov_header = [""] + [str(l) for l in labels]
+        cov_rows = [cov_header]
+        for i, lab in enumerate(labels):
+            row_data = [str(lab)]
+            for j in range(len(labels)):
+                row_data.append(f"{cov_matrix.iloc[i, j]:.6f}")
+            cov_rows.append(row_data)
+        n_c = len(cov_header)
+        cw = max(2 * cm, 16 * cm / n_c)
+        elements.append(
+            _format_table(cov_rows, col_widths=[cw] * n_c,
+                          right_align_cols=list(range(1, n_c)))
+        )
+        add_spacer(4)
+
+    # ── 11) Betas & CAPM ─────────────────────────
+    betas = report_data.get("betas")
+    capm_df = report_data.get("capm_df")
+    bench_label = report_data.get("benchmark_label", "Benchmark")
+
+    if betas is not None and len(betas) > 0:
+        add_section(f"Betas vs {bench_label}")
+        beta_rows = [["Asset", f"Beta vs {bench_label}"]]
+        sorted_betas = betas.sort_values(ascending=False)
+        for asset, beta_val in sorted_betas.items():
+            beta_rows.append([str(asset), f"{beta_val:.2f}"])
+        elements.append(
+            _format_table(beta_rows, col_widths=[8 * cm, 6 * cm], right_align_cols=[1])
+        )
+        add_spacer(4)
+
+    if capm_df is not None and isinstance(capm_df, pd.DataFrame) and not capm_df.empty:
+        add_section("CAPM Regression Results")
+        capm_display = capm_df.copy()
+        if "Alpha (daily)" in capm_display.columns:
+            capm_display["Alpha (ann.)"] = (1.0 + capm_display["Alpha (daily)"]) ** 252 - 1.0
+            display_cols = ["Asset", "Alpha (ann.)", "Beta", "R^2"]
+            display_cols = [c for c in display_cols if c in capm_display.columns]
+        else:
+            display_cols = list(capm_display.columns)
+        capm_rows = [display_cols]
+        for _, crow in capm_display.iterrows():
+            row_data = []
+            for col in display_cols:
+                val = crow[col]
+                if col == "Asset":
+                    row_data.append(str(val))
+                elif "alpha" in col.lower():
+                    row_data.append(f"{val:.2%}")
+                else:
+                    row_data.append(f"{val:.2f}" if isinstance(val, (int, float)) else str(val))
+            capm_rows.append(row_data)
+        n_c = len(display_cols)
+        cw = max(3 * cm, 16 * cm / n_c)
+        elements.append(
+            _format_table(capm_rows, col_widths=[cw] * n_c,
+                          right_align_cols=list(range(1, n_c)))
+        )
+        add_spacer(4)
+
+    # ── 12) Daily Returns Statistics ──────────────
+    portfolio_series_raw = report_data.get("portfolio_series")
+    if portfolio_series_raw is not None and len(portfolio_series_raw) > 1:
+        daily_rets = portfolio_series_raw.pct_change().dropna()
+        if len(daily_rets) > 0:
+            add_section("Daily Returns Statistics")
+            from scipy import stats as sp_stats
+            stats_rows = [["Statistic", "Value"]]
+            stats_rows.append(["Mean Daily Return", f"{daily_rets.mean():.4%}"])
+            stats_rows.append(["Std Dev (Daily)", f"{daily_rets.std():.4%}"])
+            stats_rows.append(["Skewness", f"{daily_rets.skew():.2f}"])
+            stats_rows.append(["Kurtosis", f"{daily_rets.kurtosis():.2f}"])
+            stats_rows.append(["Min Daily Return", f"{daily_rets.min():.4%}"])
+            stats_rows.append(["Max Daily Return", f"{daily_rets.max():.4%}"])
+            stats_rows.append(["Trading Days", f"{len(daily_rets):,}"])
+            elements.append(
+                _format_table(stats_rows, col_widths=[8 * cm, 6 * cm], right_align_cols=[1])
+            )
+            add_spacer(4)
+
+    # ── 13) Calendar Year Returns ─────────────────
+    cal_year_returns = report_data.get("calendar_year_returns")
+    if cal_year_returns and len(cal_year_returns) > 0:
+        add_section("Calendar Year Returns")
+        cal_rows = [["Year", "Return"]]
+        for yr, ret in cal_year_returns.items():
+            if isinstance(ret, (int, float)):
+                cal_rows.append([str(yr), f"{ret:.2%}"])
+            else:
+                cal_rows.append([str(yr), str(ret)])
+        elements.append(
+            _format_table(cal_rows, col_widths=[8 * cm, 6 * cm], right_align_cols=[1])
+        )
+        add_spacer(4)
+
+    # ── 14) Manager commentary ────────────────────
     commentary = report_data.get("commentary")
     if commentary:
         add_section("Manager Commentary")
@@ -541,7 +698,7 @@ def generate_portfolio_report(report_data: dict, output_path: str) -> str:
             elements.append(Paragraph(para_text, styles["body"]))
             add_spacer(1)
 
-    # ── 8) Transactions (optional) ────────────────
+    # ── 15) Transactions (optional) ────────────────
     transactions_df = report_data.get("transactions_df")
     if transactions_df is not None and isinstance(transactions_df, pd.DataFrame) and not transactions_df.empty:
         add_section("Recent Transactions")

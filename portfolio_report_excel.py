@@ -731,9 +731,11 @@ def _build_risk_sheet(wb, data):
         row += 1
         sb = row
         for metric, val in risk.items():
+            if val is None:
+                continue
             ws.cell(row=row, column=1, value=metric)
             cell = ws.cell(row=row, column=2)
-            if "sharpe" in metric.lower():
+            if any(k in metric.lower() for k in ("sharpe", "sortino", "ratio", "beta", "r-squared")):
                 cell.value = float(val)
                 cell.number_format = "0.00"
             else:
