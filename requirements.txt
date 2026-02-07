@@ -10,4 +10,5 @@ python-pptx>=1.0
 Pillow>=10.0
 scipy>=1.10
 openai>=1.0
+openpyxl>=3.1
 

@@ -9,6 +9,8 @@ import yfinance as yf
 import plotly.graph_objects as go
 from portfolio_report import generate_portfolio_report
 from portfolio_report_pptx import generate_pptx_report
+from portfolio_factsheet_pdf import generate_factsheet
+from portfolio_report_excel import generate_excel_report
 
 TRADING_DAYS = 252
 
@@ -840,16 +842,22 @@ def _build_report_data() -> dict:
         "frontier": {
             "pv_cloud": pv_cloud.tolist() if hasattr(pv_cloud, 'tolist') else list(pv_cloud),
             "pr_cloud": pr_cloud.tolist() if hasattr(pr_cloud, 'tolist') else list(pr_cloud),
+            "sharpe_cloud": sharpe_cloud.tolist() if hasattr(sharpe_cloud, 'tolist') else list(sharpe_cloud),
             "port_v": float(port_v),
             "port_r": float(port_r),
             "cml_v": _cml_v,
             "cml_r": _cml_r,
             "selected_label": selected_label,
         },
+        "cum_returns": cum_returns,
+        "corr_matrix": corr_matrix,
+        "cov_matrix": cov_matrix,
+        "betas": betas,
+        "capm_df": capm_df if capm_df is not None and not capm_df.empty else None,
         "commentary": _commentary,
     }
 
-dl1, dl2 = st.columns(2)
+dl1, dl2, dl3, dl4 = st.columns(4)
 with dl1:
     if st.button("📄 Generate PDF Report"):
         with st.spinner("Generating PDF…"):
@@ -879,6 +887,36 @@ with dl2:
             data=pptx_bytes,
             file_name=f"portfolio_report_{pd.Timestamp.today().strftime('%Y%m%d')}.pptx",
             mime="application/vnd.openxmlformats-officedocument.presentationml.presentation",
+        )
+with dl3:
+    if st.button("📋 Generate Fund Factsheet"):
+        with st.spinner("Generating Factsheet…"):
+            rd = _build_report_data()
+            tmp = tempfile.NamedTemporaryFile(suffix=".pdf", delete=False)
+            generate_factsheet(rd, tmp.name)
+            with open(tmp.name, "rb") as f:
+                fs_bytes = f.read()
+            os.unlink(tmp.name)
+        st.download_button(
+            label="⬇️ Save Factsheet",
+            data=fs_bytes,
+            file_name=f"fund_factsheet_{pd.Timestamp.today().strftime('%Y%m%d')}.pdf",
+            mime="application/pdf",
+        )
+with dl4:
+    if st.button("📊 Generate Excel Report"):
+        with st.spinner("Generating Excel…"):
+            rd = _build_report_data()
+            tmp = tempfile.NamedTemporaryFile(suffix=".xlsx", delete=False)
+            generate_excel_report(rd, tmp.name)
+            with open(tmp.name, "rb") as f:
+                xlsx_bytes = f.read()
+            os.unlink(tmp.name)
+        st.download_button(
+            label="⬇️ Save Excel",
+            data=xlsx_bytes,
+            file_name=f"portfolio_report_{pd.Timestamp.today().strftime('%Y%m%d')}.xlsx",
+            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
         )
 
 # =========================
