@@ -192,6 +192,13 @@ def _build_summary_sheet(wb, data):
     row += 1
     ws.cell(row=row, column=1,
             value=f"Strategy: {data.get('portfolio_label', 'N/A')}").font = BODY_FONT
+    row += 1
+
+    # Measurement currency disclaimer
+    currency_note = data.get("measurement_currency_note", "")
+    if currency_note:
+        cell = ws.cell(row=row, column=1, value=f"📐 {currency_note}")
+        cell.font = Font(name="Calibri", italic=True, size=10, color="003366")
     row += 2
 
     # Key Metrics

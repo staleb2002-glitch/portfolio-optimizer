@@ -60,6 +60,77 @@ def download_close_prices(tickers, start, end):
     return prices
 
 
+# Yahoo Finance FX ticker mapping: target currency → ticker
+# Yahoo quotes XXXUSD=X as "how many USD per 1 XXX"
+# We invert to get "how many XXX per 1 USD" (i.e. the rate to multiply USD prices by)
+_FX_TICKERS = {
+    "EUR": "EURUSD=X",   # USD per 1 EUR → inverted to EUR per 1 USD
+    "GBP": "GBPUSD=X",   # USD per 1 GBP → inverted to GBP per 1 USD
+    "CAD": "USDCAD=X",   # CAD per 1 USD → used directly (no inversion needed)
+    "AUD": "AUDUSD=X",   # USD per 1 AUD → inverted to AUD per 1 USD
+    "JPY": "USDJPY=X",   # JPY per 1 USD → used directly (no inversion needed)
+}
+
+# These tickers already give "target CCY per 1 USD", no inversion needed
+_FX_DIRECT = {"CAD", "JPY"}
+
+
+@st.cache_data(show_spinner=False)
+def download_fx_rates(currency: str, start: str, end: str) -> pd.Series:
+    """
+    Download daily FX rate to convert USD prices into *currency*.
+    Returns a Series of (1 / XXXUSD) so that:  price_CCY = price_USD * fx_rate
+    For EUR: fx_rate = 1 / EURUSD  (i.e. how many EUR per 1 USD).
+    If currency == 'USD' returns a series of 1.0.
+    """
+    if currency == "USD":
+        return pd.Series(dtype=float)  # sentinel: no conversion needed
+
+    # Yahoo quotes EURUSD=X as "how many USD per 1 EUR", so invert.
+    ticker = _FX_TICKERS.get(currency)
+    if ticker is None:
+        return pd.Series(dtype=float)
+
+    raw = yf.download(ticker, start=start, end=end, progress=False)
+    if raw is None or len(raw) == 0:
+        return pd.Series(dtype=float)
+
+    if isinstance(raw.columns, pd.MultiIndex):
+        close = raw["Close"].iloc[:, 0] if "Close" in raw.columns.get_level_values(0) else pd.Series(dtype=float)
+    else:
+        close = raw["Close"] if "Close" in raw.columns else pd.Series(dtype=float)
+
+    close = close.dropna()
+    if close.empty:
+        return pd.Series(dtype=float)
+
+    # For XXXUSD=X tickers (EUR, GBP, AUD): gives USD-per-XXX → invert to get XXX-per-USD
+    # For USDXXX=X tickers (CAD, JPY): already gives XXX-per-USD → use directly
+    if currency in _FX_DIRECT:
+        fx = close.copy()
+    else:
+        fx = 1.0 / close
+    fx = fx.ffill().bfill()
+    fx.name = currency
+    return fx
+
+
+def convert_prices_to_currency(prices: pd.DataFrame, fx_rates: pd.Series) -> pd.DataFrame:
+    """
+    Multiply USD-denominated price columns by daily FX rate to get prices in
+    the target currency.  If fx_rates is empty, return prices unchanged (USD).
+    """
+    if fx_rates.empty:
+        return prices
+    common = prices.index.intersection(fx_rates.index)
+    if len(common) < 10:
+        return prices  # not enough FX data, keep USD
+    # Align and multiply
+    p = prices.loc[common].copy()
+    fx = fx_rates.loc[common]
+    return p.multiply(fx, axis=0)
+
+
 def annual_stats(prices):
     rets = prices.pct_change().dropna()
     mu = rets.mean() * TRADING_DAYS
@@ -281,8 +352,14 @@ with st.sidebar:
     start = st.date_input("Start", value=pd.to_datetime("2019-08-01"))
     end = st.date_input("End", value=pd.to_datetime("today"))
 
+    st.markdown('<div class="sidebar-section"><div class="section-label">Capital Allocation</div></div>', unsafe_allow_html=True)
+    currency_choice = st.selectbox("Currency", ["EUR", "USD", "GBP", "CAD", "AUD", "JPY"], index=0)
+    investment_amount = st.number_input(f"Investment amount ({currency_choice})", min_value=0.0, value=10000.0, step=100.0, format="%.2f")
+    investment_horizon = st.slider("Investment horizon (years)", 1, 30, 5, 1)
+
     st.markdown('<div class="sidebar-section"><div class="section-label">Benchmark (Beta)</div></div>', unsafe_allow_html=True)
     benchmark = st.text_input("Market benchmark ticker", "SPY").strip().upper()
+    st.caption(f"Benchmark returns will be converted to {currency_choice}.")
 
     st.markdown('<div class="sidebar-section"><div class="section-label">Risk-Free & Objective</div></div>', unsafe_allow_html=True)
     rf_pct = st.slider("Risk-Free rate (annual %) ", 0.0, 20.0, 2.0, 0.1)
@@ -293,11 +370,6 @@ with st.sidebar:
     st.markdown('<div class="sidebar-section"><div class="section-label">Constraints</div></div>', unsafe_allow_html=True)
     long_only = st.checkbox("Long-only (no shorting)", value=True)
     max_w = st.slider("Max weight per asset", 0.10, 1.00, 1.00, 0.05)
-
-    st.markdown('<div class="sidebar-section"><div class="section-label">Capital Allocation</div></div>', unsafe_allow_html=True)
-    currency_choice = st.selectbox("Currency", ["EUR", "USD", "GBP", "CAD", "AUD", "JPY"], index=0)
-    investment_amount = st.number_input("Investment amount ($)", min_value=0.0, value=10000.0, step=100.0, format="%.2f")
-    investment_horizon = st.slider("Investment horizon (years)", 1, 30, 5, 1)
 
     st.markdown('<div class="sidebar-section"><div class="section-label">Engine</div></div>', unsafe_allow_html=True)
     use_cvxpy = st.checkbox("Use true optimizer (cvxpy when available)", value=True)
@@ -356,9 +428,21 @@ if len(tickers) < 2:
 # Compute results
 # =========================
 try:
-    prices = download_close_prices(tickers, str(start), str(end))
-    if prices.empty or prices.shape[0] < 60:
+    prices_usd = download_close_prices(tickers, str(start), str(end))
+    if prices_usd.empty or prices_usd.shape[0] < 60:
         st.error("Not enough price data. Try different tickers or a wider date range.")
+        st.stop()
+
+    # ── FX conversion: convert all prices to the selected currency ──
+    fx_rates = download_fx_rates(currency_choice, str(start), str(end))
+    if currency_choice != "USD" and fx_rates.empty:
+        st.warning(
+            f"⚠️ Could not download {currency_choice}/USD exchange rates. "
+            f"Falling back to USD-denominated returns."
+        )
+    prices = convert_prices_to_currency(prices_usd, fx_rates)
+    if prices.empty or prices.shape[0] < 60:
+        st.error("Not enough price data after FX conversion. Try a wider date range.")
         st.stop()
 
     rets, mu, cov = annual_stats(prices)
@@ -367,10 +451,11 @@ try:
     cov_matrix = cov.copy()
     corr_matrix = rets.corr()
 
-    # Betas vs benchmark
+    # Betas vs benchmark (also converted to the selected currency)
     betas = None
     capm_df = pd.DataFrame()
-    bench_prices = download_close_prices([benchmark], str(start), str(end))
+    bench_prices_usd = download_close_prices([benchmark], str(start), str(end))
+    bench_prices = convert_prices_to_currency(bench_prices_usd, fx_rates)
     if not bench_prices.empty:
         bench_rets = bench_prices.pct_change().dropna().iloc[:, 0]
         common_idx = rets.index.intersection(bench_rets.index)
@@ -526,8 +611,13 @@ try:
     weights_df = weights_df.sort_values("Weight", ascending=False).reset_index(drop=True)
 
     # Compute total (cumulative) period return from weighted daily returns
+    # Include the risk-free leg: r_p,t = w_rf * rf_daily + Σ w_i * r_i,t
+    rf_daily_rate = (1.0 + float(rf)) ** (1.0 / TRADING_DAYS) - 1.0
+    rf_row = weights_df.loc[weights_df["Asset"] == "RISK-FREE", "Weight"]
+    w_rf_actual = float(rf_row.iloc[0]) if not rf_row.empty else 0.0
+
     w_risky_only = weights_df[weights_df["Asset"] != "RISK-FREE"].copy()
-    port_daily_rets = pd.Series(0.0, index=rets.index)
+    port_daily_rets = pd.Series(w_rf_actual * rf_daily_rate, index=rets.index)
     for _, row in w_risky_only.iterrows():
         asset = row["Asset"]
         wgt = float(row["Weight"])
@@ -545,8 +635,7 @@ try:
     max_drawdown = float(drawdown_series.min()) if len(drawdown_series) > 0 else 0.0
 
     # Sortino Ratio (downside deviation)
-    rf_daily = (1.0 + float(rf)) ** (1.0 / TRADING_DAYS) - 1.0
-    excess_daily = port_daily_rets - rf_daily
+    excess_daily = port_daily_rets - rf_daily_rate
     downside = excess_daily[excess_daily < 0]
     downside_std = float(np.sqrt((downside ** 2).mean()) * np.sqrt(TRADING_DAYS)) if len(downside) > 0 else np.nan
     sortino_ratio = float((port_r - rf) / downside_std) if downside_std > 1e-12 else np.nan
@@ -565,8 +654,8 @@ try:
             tracking_error = float(active_rets.std() * np.sqrt(TRADING_DAYS))
             information_ratio = float(active_rets.mean() * TRADING_DAYS / tracking_error) if tracking_error > 1e-12 else np.nan
             # Portfolio-level Alpha, Beta, R²
-            bx = (bench_rets_daily.loc[common_idx_te] - rf_daily).values
-            by = (port_daily_rets.loc[common_idx_te] - rf_daily).values
+            bx = (bench_rets_daily.loc[common_idx_te] - rf_daily_rate).values
+            by = (port_daily_rets.loc[common_idx_te] - rf_daily_rate).values
             bx_mean = float(np.mean(bx))
             by_mean = float(np.mean(by))
             denom_b = float(np.sum((bx - bx_mean) ** 2))
@@ -614,6 +703,8 @@ except Exception as e:
 # =========================
 max_sharpe_cloud = float(np.nanmax(sharpe_cloud)) if len(sharpe_cloud) > 0 else np.nan
 st.markdown("### Key Metrics")
+st.info(f"📐 All risk and performance metrics are measured in **{currency_choice}**. "
+        f"Asset and benchmark returns have been converted to {currency_choice}.")
 k1, k2, k3, k4, k5, k6, k7, k8 = st.columns(8)
 with k1:
     st.metric("Annual Return", f"{port_r:.2%}")
@@ -701,8 +792,13 @@ st.markdown("---")
 def _build_report_data() -> dict:
     """Assemble report_data dict from current optimizer state."""
     # Weighted portfolio daily returns
+    # Include the risk-free leg: r_p,t = w_rf * rf_daily + Σ w_i * r_i,t
+    rf_daily_rate = (1.0 + float(rf)) ** (1.0 / TRADING_DAYS) - 1.0
+    rf_row = weights_df.loc[weights_df["Asset"] == "RISK-FREE", "Weight"]
+    w_rf_actual = float(rf_row.iloc[0]) if not rf_row.empty else 0.0
+
     w_risky_only = weights_df[weights_df["Asset"] != "RISK-FREE"].copy()
-    port_daily = pd.Series(0.0, index=rets.index)
+    port_daily = pd.Series(w_rf_actual * rf_daily_rate, index=rets.index)
     for _, row in w_risky_only.iterrows():
         asset = row["Asset"]
         wgt = float(row["Weight"])
@@ -776,8 +872,10 @@ def _build_report_data() -> dict:
     _commentary = [
         f"Strategy: {selected_label}. "
         f"Expected annual return {port_r:.2%} with {port_v:.2%} volatility (Sharpe {port_s:.2f}).",
+        f"All risk and performance metrics are measured in {currency_choice}. "
+        f"Asset and benchmark returns have been converted to {currency_choice}.",
         f"Assets analyzed over {start} – {end}. "
-        f"Risk-free rate assumed at {rf:.2%} annually. Benchmark: {benchmark}.",
+        f"Risk-free rate assumed at {rf:.2%} annually. Benchmark: {benchmark} (returns in {currency_choice}).",
     ]
 
     return {
@@ -830,6 +928,10 @@ def _build_report_data() -> dict:
         "fv_upper": fv_upper,
         "fv_lower": fv_lower,
         "commentary": _commentary,
+        "measurement_currency_note": (
+            f"All risk and performance metrics are measured in {currency_choice}. "
+            f"Asset and benchmark returns have been converted to {currency_choice}."
+        ),
     }
 
 dl1, dl2, dl3, dl4 = st.columns(4)

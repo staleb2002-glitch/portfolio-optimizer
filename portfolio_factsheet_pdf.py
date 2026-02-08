@@ -429,6 +429,16 @@ def _page1(c: canvas.Canvas, rd: dict):
         y_left = _draw_key_value_row(c, MARGIN_L, y_left, label, val,
                                      label_w=110, font_size=8.5)
 
+    # Measurement currency disclaimer
+    currency_note = rd.get("measurement_currency_note", "")
+    if currency_note:
+        y_left -= 6
+        c.setFont("Helvetica-Oblique", 7)
+        c.setFillColor(colors.HexColor("#003366"))
+        c.drawString(MARGIN_L, y_left, f"\ud83d\udcd0 {currency_note}")
+        c.setFillColor(colors.HexColor("#222222"))
+        y_left -= 10
+
     # Right: Performance Summary Table
     y_right = _draw_section_heading(c, col_right_x, y_right, "Performance Summary", col_right_w)
 

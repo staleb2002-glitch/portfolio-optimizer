@@ -463,6 +463,16 @@ def generate_portfolio_report(report_data: dict, output_path: str) -> str:
                 styles["subtitle"],
             )
         )
+
+    # Measurement currency disclaimer
+    currency_note = report_data.get("measurement_currency_note", "")
+    if currency_note:
+        elements.append(
+            Paragraph(
+                f"<i>\ud83d\udcd0 {currency_note}</i>",
+                styles["subtitle"],
+            )
+        )
     add_spacer(6)
 
     # Decorative rule
