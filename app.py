@@ -19,14 +19,14 @@ st.set_page_config(page_title="Portfolio Optimizer", layout="wide")
 CSS = """
 <style>
 .block-container { padding-top: 1.1rem; padding-bottom: 2rem; max-width: 1350px; }
-.small-muted { color: rgba(255,255,255,0.7); font-size: 0.9rem; }
+.small-muted { color: rgba(0,0,0,0.55); font-size: 0.9rem; }
 .kpi { font-size: 0.95rem; font-weight: 700; margin: 0; }
-.kpi-sub { color: rgba(255,255,255,0.85); font-size: 0.8rem; margin: 0; }
-.kpi-amount { font-size: 0.9rem; font-weight: 700; margin: 0; white-space: nowrap; }
-.kpi-amount-label { color: rgba(255,255,255,0.85); font-size: 0.75rem; margin: 0; }
-hr { border-color: rgba(0,0,0,0.1); }
+.kpi-sub { color: rgba(0,0,0,0.65); font-size: 0.8rem; margin: 0; }
+.kpi-amount { font-size: 0.9rem; font-weight: 700; margin: 0; white-space: nowrap; color: #31333F; }
+.kpi-amount-label { color: rgba(0,0,0,0.65); font-size: 0.75rem; margin: 0; }
+hr { border-color: rgba(0,0,0,0.12); }
 /* Fit metrics in 8 columns */
-[data-testid="stMetric"] label { font-size: 0.8rem !important; color: rgba(255,255,255,0.85) !important; }
+[data-testid="stMetric"] label { font-size: 0.8rem !important; color: rgba(0,0,0,0.65) !important; }
 [data-testid="stMetric"] [data-testid="stMetricValue"] { font-size: 1.15rem !important; }
 </style>
 """
@@ -40,23 +40,43 @@ st.write(
 
 # ---------------- Data ----------------
 @st.cache_data(show_spinner=False)
-def download_close_prices(tickers, start, end):
+def download_close_prices(tickers, start, end) -> pd.DataFrame:
+    """
+    Download close prices from Yahoo Finance.
+
+    Key change: removed bfill() to avoid look-ahead bias.
+    We forward-fill small gaps, then align series to a common start date by dropping
+    remaining NaNs row-wise (ensures all assets have real history from that point).
+    """
     raw = yf.download(tickers, start=start, end=end, progress=False)
     if raw is None or len(raw) == 0:
         return pd.DataFrame()
 
+    # Handle yfinance column shapes
     if isinstance(raw.columns, pd.MultiIndex):
         if "Close" not in raw.columns.get_level_values(0):
             return pd.DataFrame()
-        prices = raw["Close"]
+        prices = raw["Close"].copy()
     else:
         if "Close" not in raw.columns:
             return pd.DataFrame()
-        prices = raw[["Close"]].rename(columns={"Close": tickers[0]})
+        prices = raw[["Close"]].copy()
+        # single ticker -> rename
+        if len(tickers) == 1:
+            prices = prices.rename(columns={"Close": tickers[0]})
 
     prices = prices.dropna(how="all")
-    prices = prices.ffill().bfill()  # fill gaps: ffill for holidays, bfill for late-start tickers
-    prices = prices.dropna(axis=1, how="any")  # drop tickers still missing data
+
+    # Forward-fill only (no bfill) to avoid look-ahead bias
+    prices = prices.ffill()
+
+    # Drop columns that are still entirely missing
+    prices = prices.dropna(axis=1, how="all")
+
+    # Align to common history: drop any rows with missing data
+    # (ensures you don't fabricate early history for late-start tickers)
+    prices = prices.dropna(axis=0, how="any")
+
     return prices
 
 
@@ -224,6 +244,40 @@ def cml_metrics(alpha, w_tan, mu, cov, rf):
     return float(r_p), float(v_p), float(s_p), float(r_t), float(v_t)
 
 
+def rf_daily_from_annual(rf_annual: float) -> float:
+    return (1.0 + float(rf_annual)) ** (1.0 / TRADING_DAYS) - 1.0
+
+
+def portfolio_daily_returns_from_weights(
+    weights_df: pd.DataFrame,
+    asset_returns: pd.DataFrame,
+    rf_annual: float,
+) -> pd.Series:
+    """
+    Build portfolio daily return series from weights_df.
+    IMPORTANT FIX: includes risk-free leg when present (RISK-FREE row).
+    """
+    rf_d = rf_daily_from_annual(rf_annual)
+
+    # Start with RF contribution (supports leverage if RF weight is negative)
+    w_rf = 0.0
+    if "RISK-FREE" in set(weights_df["Asset"]):
+        w_rf = float(weights_df.loc[weights_df["Asset"] == "RISK-FREE", "Weight"].iloc[0])
+
+    port = pd.Series(w_rf * rf_d, index=asset_returns.index, dtype=float)
+
+    # Add risky assets
+    for _, row in weights_df.iterrows():
+        asset = row["Asset"]
+        if asset == "RISK-FREE":
+            continue
+        w = float(row["Weight"])
+        if asset in asset_returns.columns:
+            port = port + w * asset_returns[asset]
+
+    return port
+
+
 # ---------------- Optional cvxpy ----------------
 def _has_cvxpy() -> bool:
     try:
@@ -256,18 +310,45 @@ def solve_target_vol_max_return(mu, cov, target_vol, long_only=True, max_w=1.0):
     return wv / wv.sum()
 
 
+def solve_min_variance(mu, cov, long_only=True, max_w=1.0):
+    """Minimize variance subject to fully-invested and constraints."""
+    import cvxpy as cp
+    n = len(mu)
+    w = cp.Variable(n)
+    risk = cp.quad_form(w, cov.values)
+
+    cons = [cp.sum(w) == 1]
+    if long_only:
+        cons.append(w >= 0)
+    if max_w < 1.0:
+        cons.append(w <= max_w)
+
+    prob = cp.Problem(cp.Minimize(risk), cons)
+    prob.solve(solver=cp.SCS, verbose=False)
+
+    if w.value is None:
+        raise RuntimeError("Min-variance optimization failed.")
+    wv = np.array(w.value).reshape(-1)
+    wv[np.abs(wv) < 1e-8] = 0.0
+    return wv / wv.sum()
+
+
 def solve_max_sharpe(mu, cov, rf, long_only=True, max_w=1.0):
     """
-    Convex proxy: maximize excess return subject to risk == 1.
-    Returns tangency weights over risky assets.
+    More defensible Sharpe "direction" via convex program:
+    maximize excess return subject to variance <= 1.
+
+    We do NOT impose sum(w)=1 here; we normalize after to get weights that sum to 1.
+    This avoids the incorrect (risk==1 AND sum(w)==1) constraint combo.
     """
     import cvxpy as cp
     n = len(mu)
     w = cp.Variable(n)
+
     excess = (mu.values - rf) @ w
     risk = cp.quad_form(w, cov.values)
 
-    cons = [cp.sum(w) == 1, risk == 1.0]
+    cons = [risk <= 1.0]
     if long_only:
         cons.append(w >= 0)
     if max_w < 1.0:
@@ -280,7 +361,11 @@ def solve_max_sharpe(mu, cov, rf, long_only=True, max_w=1.0):
         raise RuntimeError("Max-Sharpe optimization failed.")
     wv = np.array(w.value).reshape(-1)
     wv[np.abs(wv) < 1e-8] = 0.0
-    return wv / wv.sum()
+
+    s = float(wv.sum())
+    if abs(s) < 1e-12:
+        raise RuntimeError("Max-Sharpe solution is ~0; cannot normalize.")
+    return wv / s
 
 
 # ---------------- Risk diagnostics ----------------
@@ -297,7 +382,7 @@ def compute_capm_metrics(
     benchmark_returns: pd.Series,
     rf_annual: float,
 ) -> pd.DataFrame:
-    rf_daily = (1.0 + float(rf_annual)) ** (1.0 / TRADING_DAYS) - 1.0
+    rf_daily = rf_daily_from_annual(rf_annual)
     mkt_excess = benchmark_returns - rf_daily
 
     rows = []
@@ -552,40 +637,37 @@ try:
             weights_df = pd.DataFrame({"Asset": list(prices.columns), "Weight": list(w_min)})
 
     elif active_strategy == "Custom Allocation" and custom_weights_input:
-        # User-defined weights (risky assets + optional risk-free)
         total_pct = sum(custom_weights_input.values()) + custom_rf_weight
-        w_raw = np.array([custom_weights_input.get(t, 0.0) for t in prices.columns])
-        w_rf_raw = custom_rf_weight
+        w_raw = np.array([custom_weights_input.get(t, 0.0) for t in prices.columns], dtype=float)
+        w_rf_raw = float(custom_rf_weight)
+
         if total_pct > 0:
-            scale = 1.0 / total_pct  # normalise percentages to fractions summing to 1
+            scale = 1.0 / total_pct
             w_custom = w_raw * scale
             w_rf = w_rf_raw * scale
         else:
-            w_custom = np.ones(len(prices.columns)) / (len(prices.columns) + (1 if include_rf else 0))
-            w_rf = 1.0 / (len(prices.columns) + 1) if include_rf else 0.0
+            denom = len(prices.columns) + (1 if include_rf else 0)
+            w_custom = np.ones(len(prices.columns)) / max(denom, 1)
+            w_rf = 1.0 / denom if include_rf else 0.0
 
-        if include_rf and w_rf > 1e-9:
-            # Blend: portfolio return = w_rf * rf + (1 - w_rf) * risky_return
-            alpha = 1.0 - w_rf  # fraction in risky assets
-            w_risky_normed = w_custom / w_custom.sum() if w_custom.sum() > 1e-12 else w_custom
-            port_r_risky, port_v_risky = portfolio_metrics_risky(w_risky_normed, mu, cov)
-            port_r = w_rf * rf + alpha * port_r_risky
-            port_v = alpha * port_v_risky
+        weights_rows = [{"Asset": "RISK-FREE", "Weight": w_rf}] if include_rf else []
+        weights_rows += [{"Asset": tk, "Weight": float(w)} for tk, w in zip(prices.columns, w_custom)]
+        weights_df = pd.DataFrame(weights_rows)
+
+        # Compute moments (expected) from weights
+        if include_rf:
+            alpha = 1.0 - w_rf
+            w_risky_norm = w_custom / w_custom.sum() if w_custom.sum() > 1e-12 else w_custom
+            r_risky, v_risky = portfolio_metrics_risky(w_risky_norm, mu, cov)
+            port_r = w_rf * rf + alpha * r_risky
+            port_v = abs(alpha) * v_risky
             port_s = (port_r - rf) / port_v if port_v > 0 else np.nan
             selected_label = f"Custom Allocation (RF {w_rf:.0%})"
-            weights_df = pd.DataFrame(
-                {"Asset": ["RISK-FREE"] + list(prices.columns),
-                 "Weight": [w_rf] + list(w_custom)}
-            )
         else:
-            if w_raw.sum() > 0:
-                w_custom = w_raw / w_raw.sum()
-            else:
-                w_custom = np.ones(len(prices.columns)) / len(prices.columns)
+            w_custom = w_custom / w_custom.sum() if w_custom.sum() > 1e-12 else w_custom
             port_r, port_v = portfolio_metrics_risky(w_custom, mu, cov)
             port_s = (port_r - rf) / port_v if port_v > 0 else np.nan
             selected_label = "Custom Allocation"
-            weights_df = pd.DataFrame({"Asset": list(prices.columns), "Weight": list(w_custom)})
 
     else:  # Max Sharpe (default)
         if include_rf:
@@ -610,19 +692,9 @@ try:
     weights_df["Weight"] = weights_df["Weight"].astype(float)
     weights_df = weights_df.sort_values("Weight", ascending=False).reset_index(drop=True)
 
-    # Compute total (cumulative) period return from weighted daily returns
-    # Include the risk-free leg: r_p,t = w_rf * rf_daily + Σ w_i * r_i,t
-    rf_daily_rate = (1.0 + float(rf)) ** (1.0 / TRADING_DAYS) - 1.0
-    rf_row = weights_df.loc[weights_df["Asset"] == "RISK-FREE", "Weight"]
-    w_rf_actual = float(rf_row.iloc[0]) if not rf_row.empty else 0.0
+    # ====== IMPORTANT FIX: portfolio daily returns INCLUDE RISK-FREE leg ======
+    port_daily_rets = portfolio_daily_returns_from_weights(weights_df, rets, rf)
 
-    w_risky_only = weights_df[weights_df["Asset"] != "RISK-FREE"].copy()
-    port_daily_rets = pd.Series(w_rf_actual * rf_daily_rate, index=rets.index)
-    for _, row in w_risky_only.iterrows():
-        asset = row["Asset"]
-        wgt = float(row["Weight"])
-        if asset in rets.columns:
-            port_daily_rets = port_daily_rets + rets[asset] * wgt
     total_period_return = float((1 + port_daily_rets).prod() - 1)
     n_years = len(rets) / TRADING_DAYS
     total_return_cash = float(investment_amount) * total_period_return
@@ -634,8 +706,9 @@ try:
     drawdown_series = (port_cum - running_max) / running_max
     max_drawdown = float(drawdown_series.min()) if len(drawdown_series) > 0 else 0.0
 
-    # Sortino Ratio (downside deviation)
-    excess_daily = port_daily_rets - rf_daily_rate
+    # Sortino Ratio
+    rf_daily = rf_daily_from_annual(rf)
+    excess_daily = port_daily_rets - rf_daily
     downside = excess_daily[excess_daily < 0]
     downside_std = float(np.sqrt((downside ** 2).mean()) * np.sqrt(TRADING_DAYS)) if len(downside) > 0 else np.nan
     sortino_ratio = float((port_r - rf) / downside_std) if downside_std > 1e-12 else np.nan
@@ -653,9 +726,9 @@ try:
             active_rets = port_daily_rets.loc[common_idx_te] - bench_rets_daily.loc[common_idx_te]
             tracking_error = float(active_rets.std() * np.sqrt(TRADING_DAYS))
             information_ratio = float(active_rets.mean() * TRADING_DAYS / tracking_error) if tracking_error > 1e-12 else np.nan
-            # Portfolio-level Alpha, Beta, R²
-            bx = (bench_rets_daily.loc[common_idx_te] - rf_daily_rate).values
-            by = (port_daily_rets.loc[common_idx_te] - rf_daily_rate).values
+            # Portfolio-level alpha/beta on excess returns
+            bx = (bench_rets_daily.loc[common_idx_te] - rf_daily).values
+            by = (port_daily_rets.loc[common_idx_te] - rf_daily).values
             bx_mean = float(np.mean(bx))
             by_mean = float(np.mean(by))
             denom_b = float(np.sum((bx - bx_mean) ** 2))
@@ -691,6 +764,16 @@ try:
         "port_alpha": port_alpha,
         "port_beta": port_beta,
         "port_r_squared": port_r_squared,
+        "port_daily_rets": port_daily_rets,
+        "rets": rets,
+        "mu": mu,
+        "cov": cov,
+        "w_tan": w_tan,
+        "pv_cloud": pv_cloud,
+        "pr_cloud": pr_cloud,
+        "sharpe_cloud": sharpe_cloud,
+        "cum_returns": cum_returns,
+        "bench_prices": bench_prices,
     }
 
 except Exception as e:
@@ -747,13 +830,39 @@ with k13:
 with k14:
     st.metric(f"Beta vs {benchmark}", f"{port_beta:.2f}" if np.isfinite(port_beta) else "N/A")
 
-# Third row of KPIs – Expected Future Value
-expected_future_value = float(investment_amount) * (1 + float(port_r)) ** investment_horizon
+# Third row – Expected Future Value (lognormal bands)
+def future_value_lognormal(
+    pv: float, mu_ann: float, sigma_ann: float, years: int
+) -> dict:
+    """
+    Expected value uses arithmetic compounding: E[V]=V0*(1+mu)^T.
+    Bands use lognormal: ln(V_T/V0) ~ N( (ln(1+mu)-0.5*sigma^2)T, sigma*sqrt(T) ).
+    """
+    T = float(years)
+    pv = float(pv)
+    mu_ann = float(mu_ann)
+    sigma_ann = float(max(0.0, sigma_ann))
+    mu_for_log = max(mu_ann, -0.9999)
+
+    expected = pv * (1.0 + mu_ann) ** years
+    mu_log = (np.log1p(mu_for_log) - 0.5 * sigma_ann ** 2) * T
+    sig_log = sigma_ann * np.sqrt(T)
+
+    median = pv * np.exp(mu_log)
+    upper_1s = pv * np.exp(mu_log + 1.0 * sig_log)
+    lower_1s = pv * np.exp(mu_log - 1.0 * sig_log)
+
+    return {
+        "expected": float(expected),
+        "median": float(median),
+        "upper_1s": float(upper_1s),
+        "lower_1s": float(lower_1s),
+    }
+
+fv = future_value_lognormal(investment_amount, port_r, port_v, investment_horizon)
+expected_future_value = fv["expected"]
 expected_pnl_horizon = expected_future_value - float(investment_amount)
-expected_cagr = float(port_r)  # already annualized
-# Confidence intervals using volatility (±1σ)
-fv_upper = float(investment_amount) * (1 + float(port_r) + float(port_v)) ** investment_horizon
-fv_lower = float(investment_amount) * max(0, (1 + float(port_r) - float(port_v))) ** investment_horizon
+expected_cagr = float(port_r)
 
 st.markdown(f"### Expected Future Value ({investment_horizon}Y Horizon)")
 f1, f2, f3, f4, f5 = st.columns(5)
@@ -773,14 +882,14 @@ with f3:
     st.metric(f"CAGR ({investment_horizon}Y)", f"{expected_cagr:.2%}")
 with f4:
     st.markdown(
-        f"<div class=\"kpi-amount\">{fv_upper:,.2f} {currency_choice}</div>"
-        f"<div class=\"kpi-amount-label\">Optimistic (+1σ)</div>",
+        f"<div class=\"kpi-amount\">{fv['upper_1s']:,.2f} {currency_choice}</div>"
+        f"<div class=\"kpi-amount-label\">Optimistic (+1σ, lognormal)</div>",
         unsafe_allow_html=True,
     )
 with f5:
     st.markdown(
-        f"<div class=\"kpi-amount\">{fv_lower:,.2f} {currency_choice}</div>"
-        f"<div class=\"kpi-amount-label\">Pessimistic (−1σ)</div>",
+        f"<div class=\"kpi-amount\">{fv['lower_1s']:,.2f} {currency_choice}</div>"
+        f"<div class=\"kpi-amount-label\">Pessimistic (−1σ, lognormal)</div>",
         unsafe_allow_html=True,
     )
 
@@ -790,23 +899,14 @@ st.markdown("---")
 # PDF Report Download
 # =========================
 def _build_report_data() -> dict:
-    """Assemble report_data dict from current optimizer state."""
-    # Weighted portfolio daily returns
-    # Include the risk-free leg: r_p,t = w_rf * rf_daily + Σ w_i * r_i,t
-    rf_daily_rate = (1.0 + float(rf)) ** (1.0 / TRADING_DAYS) - 1.0
-    rf_row = weights_df.loc[weights_df["Asset"] == "RISK-FREE", "Weight"]
-    w_rf_actual = float(rf_row.iloc[0]) if not rf_row.empty else 0.0
-
-    w_risky_only = weights_df[weights_df["Asset"] != "RISK-FREE"].copy()
-    port_daily = pd.Series(w_rf_actual * rf_daily_rate, index=rets.index)
-    for _, row in w_risky_only.iterrows():
-        asset = row["Asset"]
-        wgt = float(row["Weight"])
-        if asset in rets.columns:
-            port_daily = port_daily + rets[asset] * wgt
+    """
+    IMPORTANT FIX: report portfolio series uses the same correct portfolio daily returns
+    including the risk-free leg when enabled.
+    """
+    # Use already-correct daily series from session state
+    port_daily = st.session_state.app_context["port_daily_rets"]
     port_cum = (1 + port_daily).cumprod()
 
-    # Performance: compute weighted period returns from cumulative series
     perf = {}
     total_days = len(port_cum)
     if total_days > 21:
@@ -836,35 +936,38 @@ def _build_report_data() -> dict:
     # Scale cumulative to base 100 for chart
     port_cum_chart = port_cum * 100
 
-    # Holdings table
-    h_df = weights_df.copy()
+    # Max drawdown from cumulative series
+    running_max = port_cum.cummax()
+    drawdown = (port_cum - running_max) / running_max
+    max_dd_report = float(drawdown.min()) if len(drawdown) > 0 else 0.0
+
+    # Future value (lognormal bands) for report
+    fv2 = future_value_lognormal(investment_amount, port_r, port_v, investment_horizon)
+
+    weights_df_local = st.session_state.app_context["weights_df"].copy()
+    h_df = weights_df_local.copy()
     h_df.columns = ["Ticker", "Weight"]
     h_df["Market Value"] = h_df["Weight"] * float(investment_amount)
     h_df["P/L"] = h_df["Market Value"] * float(port_r)
 
-    # Benchmark cumulative
     bench_cum = None
     try:
-        if not bench_prices.empty:
-            b_rets = bench_prices.pct_change().dropna().iloc[:, 0]
+        bench_prices_local = st.session_state.app_context["bench_prices"]
+        if bench_prices_local is not None and not bench_prices_local.empty:
+            b_rets = bench_prices_local.pct_change().dropna().iloc[:, 0]
             common = port_daily.index.intersection(b_rets.index)
             if len(common) > 10:
                 bench_cum = (1 + b_rets.loc[common]).cumprod() * 100
     except Exception:
         pass
 
-    # Max drawdown
-    running_max = port_cum.cummax()
-    drawdown = (port_cum - running_max) / running_max
-    max_dd = float(drawdown.min()) if len(drawdown) > 0 else 0.0
-
-    # CML curve data for frontier chart
+    # CML curve
     _cml_v, _cml_r = None, None
     if include_rf:
         _alphas = np.linspace(0.0, leverage_cap, 80)
         _cml_v, _cml_r = [], []
         for _a in _alphas:
-            _rr, _vv, _, _, _ = cml_metrics(float(_a), w_tan, mu, cov, rf)
+            _rr, _vv, _, _, _ = cml_metrics(float(_a), st.session_state.app_context["w_tan"], mu, cov, rf)
             _cml_r.append(float(_rr))
             _cml_v.append(float(_vv))
 
@@ -888,7 +991,7 @@ def _build_report_data() -> dict:
             "Volatility": float(port_v),
             "Sharpe Ratio": float(port_s),
             "Sortino Ratio": float(sortino_ratio) if np.isfinite(sortino_ratio) else None,
-            "Max Drawdown": max_drawdown,
+            "Max Drawdown": float(max_dd_report),
             "Tracking Error": float(tracking_error) if np.isfinite(tracking_error) else None,
             "Information Ratio": float(information_ratio) if np.isfinite(information_ratio) else None,
             "Alpha": float(port_alpha) if np.isfinite(port_alpha) else None,
@@ -897,36 +1000,33 @@ def _build_report_data() -> dict:
         },
         "calendar_year_returns": cal_year_returns,
         "inception_date": str(start),
-        "num_holdings": len([w for w in weights_df["Weight"] if abs(float(w)) > 0.001]),
-        "weights": {
-            row["Asset"]: float(row["Weight"])
-            for _, row in weights_df.iterrows()
-        },
+        "num_holdings": int((weights_df_local["Weight"].abs() > 0.001).sum()),
+        "weights": {row["Asset"]: float(row["Weight"]) for _, row in weights_df_local.iterrows()},
         "holdings_df": h_df,
         "portfolio_series": port_cum_chart,
         "benchmark_series": bench_cum,
         "portfolio_label": selected_label,
         "benchmark_label": benchmark,
         "frontier": {
-            "pv_cloud": pv_cloud.tolist() if hasattr(pv_cloud, 'tolist') else list(pv_cloud),
-            "pr_cloud": pr_cloud.tolist() if hasattr(pr_cloud, 'tolist') else list(pr_cloud),
-            "sharpe_cloud": sharpe_cloud.tolist() if hasattr(sharpe_cloud, 'tolist') else list(sharpe_cloud),
+            "pv_cloud": list(st.session_state.app_context["pv_cloud"]),
+            "pr_cloud": list(st.session_state.app_context["pr_cloud"]),
+            "sharpe_cloud": list(st.session_state.app_context["sharpe_cloud"]),
             "port_v": float(port_v),
             "port_r": float(port_r),
             "cml_v": _cml_v,
             "cml_r": _cml_r,
             "selected_label": selected_label,
         },
-        "cum_returns": cum_returns,
+        "cum_returns": st.session_state.app_context["cum_returns"],
         "corr_matrix": corr_matrix,
         "cov_matrix": cov_matrix,
         "betas": betas,
         "capm_df": capm_df if capm_df is not None and not capm_df.empty else None,
         "investment_horizon": investment_horizon,
-        "expected_future_value": expected_future_value,
-        "expected_pnl_horizon": expected_pnl_horizon,
-        "fv_upper": fv_upper,
-        "fv_lower": fv_lower,
+        "expected_future_value": fv2["expected"],
+        "expected_pnl_horizon": fv2["expected"] - float(investment_amount),
+        "fv_upper": fv2["upper_1s"],
+        "fv_lower": fv2["lower_1s"],
         "commentary": _commentary,
         "measurement_currency_note": (
             f"All risk and performance metrics are measured in {currency_choice}. "
@@ -1081,77 +1181,8 @@ with tab1:
     else:
         st.info("Betas not available (benchmark download failed or not enough overlap).")
 
-    st.write("**Selected Asset CAPM Scatter**")
-    if capm_df is not None and not capm_df.empty and not bench_prices.empty:
-        capm_table = capm_df.copy()
-        capm_table["Alpha (annualized)"] = (1.0 + capm_table["Alpha (daily)"]) ** TRADING_DAYS - 1.0
-        capm_table = capm_table[["Asset", "Alpha (annualized)", "Beta", "R^2", "Corr (excess vs mkt)"]]
-        st.dataframe(capm_table, width='stretch', height=220)
-
-        asset_choice = st.selectbox("Asset", list(rets.columns), key="capm_asset_select")
-
-        rf_daily = (1.0 + float(rf)) ** (1.0 / TRADING_DAYS) - 1.0
-        bench_rets = bench_prices.pct_change().dropna().iloc[:, 0]
-        asset_rets = rets[asset_choice].dropna()
-
-        common_idx = asset_rets.index.intersection(bench_rets.index)
-        if len(common_idx) >= 60:
-            a = (asset_rets.loc[common_idx] - rf_daily).values
-            m = (bench_rets.loc[common_idx] - rf_daily).values
-
-            x = m
-            y = a
-            x_mean = float(np.mean(x))
-            y_mean = float(np.mean(y))
-            denom = float(np.sum((x - x_mean) ** 2))
-            beta = float(np.sum((x - x_mean) * (y - y_mean)) / denom) if denom > 1e-12 else 0.0
-            alpha = float(y_mean - beta * x_mean)
-            corr = float(np.corrcoef(x, y)[0, 1]) if len(x) > 1 else np.nan
-            r2 = float(corr ** 2) if np.isfinite(corr) else np.nan
-
-            x_line = np.linspace(np.min(x), np.max(x), 60)
-            y_line = alpha + beta * x_line
-
-            sel_fig = go.Figure()
-            sel_fig.add_trace(
-                go.Scatter(
-                    x=x,
-                    y=y,
-                    mode="markers",
-                    marker=dict(size=7, color="rgba(31, 119, 180, 0.6)"),
-                    name="Daily excess returns",
-                    hovertemplate=
-                        f"<b>{asset_choice}</b><br>Excess mkt: %{{x:.2%}}<br>Excess asset: %{{y:.2%}}<extra></extra>",
-                )
-            )
-            sel_fig.add_trace(
-                go.Scatter(
-                    x=x_line,
-                    y=y_line,
-                    mode="lines",
-                    line=dict(color="orange", width=2),
-                    name="CAPM fit",
-                    hovertemplate="CAPM fit<extra></extra>",
-                )
-            )
-            sel_fig.update_layout(
-                height=360,
-                margin=dict(l=10, r=10, t=40, b=10),
-                xaxis_title=f"{benchmark} Excess Return (daily)",
-                yaxis_title=f"{asset_choice} Excess Return (daily)",
-                title=f"{asset_choice}: α={alpha:.4%}, β={beta:.2f}, R²={r2:.2f}",
-            )
-            st.plotly_chart(sel_fig, use_container_width=True)
-        else:
-            st.info("Not enough overlapping data to plot selected asset CAPM scatter.")
-    else:
-        st.info("Select assets and benchmark with sufficient data to view CAPM scatter.")
-
     show_corr = st.checkbox("Show correlation (instead of covariance)", value=False)
     mat = corr_matrix if show_corr else cov_matrix
-    title = "Correlation Heatmap" if show_corr else "Covariance Heatmap (annualized)"
-    cbar = "Corr" if show_corr else "Cov"
-
     st.dataframe(mat, width='stretch', height=250)
 
 with tab2:
